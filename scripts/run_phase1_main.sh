@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run the reproducible Phase 1 main experiment (100 prompts).
 #
-# The command is intentionally a shell launcher so another researcher can run
-# the complete pipeline without copying a notebook or manually ordering
-# stages.  Generated data/results stay under the repository and are never
-# deleted by this script.
+# This launcher bootstraps its own virtualenv, installs the pinned Python
+# dependencies, initializes KIVI, downloads the model and MPNet checkpoint,
+# and then runs the complete pipeline. Existing environments/checkpoints are
+# reused and interrupted runs can be resumed.
 
 set -Eeuo pipefail
 
@@ -12,13 +12,20 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/run_phase1_main.sh
+  bash scripts/run_phase_1
   RESUME=1 RUN_DIR=/abs/path/to/logs/phase1_main_<run-id> bash scripts/run_phase1_main.sh
   DRY_RUN=1 bash scripts/run_phase1_main.sh
+  bash scripts/run_phase1_main.sh --bootstrap-only
+  SKIP_BOOTSTRAP=1 bash scripts/run_phase1_main.sh
 
 Environment overrides:
   MODEL_NAME=Llama-3.2-1B
-  MODEL_PATH=/root/model/Llama-3.2-1B
-  EMBEDDING_PATH=/root/model/all-mpnet-base-v2
+  MODEL_ID=meta-llama/Llama-3.2-1B
+  MODEL_PATH=$PWD/.models/Llama-3.2-1B
+  EMBEDDING_ID=sentence-transformers/all-mpnet-base-v2
+  EMBEDDING_PATH=$PWD/.models/all-mpnet-base-v2
+  HF_TOKEN=<required for gated Hugging Face model downloads>
+  VENV_DIR=$PWD/.venv
   DEVICE=cuda:0
   DTYPE=float16
   SEED=42
@@ -26,10 +33,16 @@ Environment overrides:
   MAX_NEW_TOKENS=16
   RESUME=0
   RUN_DIR=<auto-created timestamped directory>
+  SKIP_BOOTSTRAP=0       # use an already prepared Python environment
+  PIP_INSTALL_ARGS=      # optional extra arguments for pip install
 
 The attack stage requires an explicit authorization acknowledgement. This
 launcher supplies --i-understand-risks; run it only on data and systems you
 are authorized to test.
+
+The default Llama checkpoint is gated by Hugging Face. Export HF_TOKEN before
+running, or set MODEL_ID to a model you are authorized to download. The
+embedding checkpoint and default dataset are public.
 EOF
 }
 
@@ -38,12 +51,27 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+BOOTSTRAP_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --bootstrap-only) BOOTSTRAP_ONLY=1 ;;
+    --no-bootstrap) SKIP_BOOTSTRAP=1 ;;
+    *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 MODEL_NAME="${MODEL_NAME:-Llama-3.2-1B}"
-MODEL_PATH="${MODEL_PATH:-/root/model/Llama-3.2-1B}"
-EMBEDDING_PATH="${EMBEDDING_PATH:-/root/model/all-mpnet-base-v2}"
+MODEL_ID="${MODEL_ID:-meta-llama/Llama-3.2-1B}"
+MODEL_ROOT="${MODEL_ROOT:-$REPO_ROOT/.models}"
+MODEL_PATH="${MODEL_PATH:-$MODEL_ROOT/$MODEL_NAME}"
+EMBEDDING_ID="${EMBEDDING_ID:-sentence-transformers/all-mpnet-base-v2}"
+EMBEDDING_PATH="${EMBEDDING_PATH:-$MODEL_ROOT/all-mpnet-base-v2}"
+MODEL_REVISION="${MODEL_REVISION:-}"
+EMBEDDING_REVISION="${EMBEDDING_REVISION:-}"
+VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-float16}"
 SEED="${SEED:-42}"
@@ -51,9 +79,137 @@ RUN_COLLISION_PLUS="${RUN_COLLISION_PLUS:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
+
+if [[ -z "${PIP_INSTALL_ARGS:-}" ]]; then
+  PIP_INSTALL_ARGS=()
+else
+  read -r -a PIP_INSTALL_ARGS <<< "$PIP_INSTALL_ARGS"
+fi
+
+absolute_path() {
+  local path="$1"
+  local parent
+  parent="$(dirname "$path")"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    mkdir -p "$parent"
+  fi
+  if [[ -d "$parent" ]]; then
+    printf '%s/%s\n' "$(cd "$parent" && pwd)" "$(basename "$path")"
+  elif [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$REPO_ROOT/$parent" "$(basename "$path")"
+  fi
+}
+
+MODEL_PATH="$(absolute_path "$MODEL_PATH")"
+EMBEDDING_PATH="$(absolute_path "$EMBEDDING_PATH")"
+
+if [[ "$SKIP_BOOTSTRAP" != "1" && "$DRY_RUN" != "1" ]]; then
+  command -v git >/dev/null 2>&1 || {
+    echo "git is required to initialize third_party/KIVI." >&2
+    exit 1
+  }
+  HOST_PYTHON="${PYTHON:-}"
+  if [[ -z "$HOST_PYTHON" ]]; then
+    HOST_PYTHON="$(command -v python3 || command -v python || true)"
+  fi
+  [[ -n "$HOST_PYTHON" ]] || {
+    echo "Python 3 is required. Install python3 and python3-venv, then rerun." >&2
+    exit 1
+  }
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    echo "[bootstrap] creating virtualenv: $VENV_DIR"
+    "$HOST_PYTHON" -m venv "$VENV_DIR" || {
+      echo "Could not create a virtualenv. On Debian/Ubuntu install python3-venv." >&2
+      exit 1
+    }
+  fi
+  export PATH="$VENV_DIR/bin:$PATH"
+  REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
+  REQUIREMENTS_STAMP="$VENV_DIR/.phase1_requirements.sha256"
+  if [[ ! -f "$REQUIREMENTS_STAMP" || "$(<"$REQUIREMENTS_STAMP")" != "$REQUIREMENTS_HASH" ]]; then
+    echo "[bootstrap] installing Python dependencies from requirements.txt"
+    python -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
+    python -m pip install --disable-pip-version-check "${PIP_INSTALL_ARGS[@]}" -r requirements.txt
+    printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_STAMP"
+  else
+    echo "[bootstrap] Python dependencies already match requirements.txt"
+  fi
+  echo "[bootstrap] initializing third_party/KIVI"
+  git submodule update --init --recursive
+else
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] would create/reuse $VENV_DIR, install requirements.txt, initialize KIVI, and download checkpoints"
+  fi
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    export PATH="$VENV_DIR/bin:$PATH"
+  fi
+fi
+
+checkpoint_has_weights() {
+  local target_dir="$1"
+  find "$target_dir" -type f \
+    \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' \) \
+    -print -quit | grep -q .
+}
+
+download_checkpoint() {
+  local repo_id="$1"
+  local target_dir="$2"
+  local revision="$3"
+  local label="$4"
+  if [[ -f "$target_dir/config.json" || -f "$target_dir/modules.json" ]] && checkpoint_has_weights "$target_dir"; then
+    echo "[bootstrap] $label checkpoint already exists: $target_dir"
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] would download $label: $repo_id -> $target_dir"
+    return 0
+  fi
+  mkdir -p "$target_dir"
+  echo "[bootstrap] downloading $label checkpoint: $repo_id"
+  if ! python - "$repo_id" "$target_dir" "$revision" <<'PY'
+import sys
+
+from huggingface_hub import snapshot_download
+
+repo_id, target_dir, revision = sys.argv[1:]
+kwargs = {"repo_id": repo_id, "local_dir": target_dir}
+if revision:
+    kwargs["revision"] = revision
+snapshot_download(**kwargs)
+PY
+  then
+    cat >&2 <<'EOF'
+Checkpoint download failed. For the default gated Llama model, accept the
+model license at https://huggingface.co/meta-llama/Llama-3.2-1B and export:
+
+  export HF_TOKEN=hf_...
+
+Then rerun the same command. You can also set MODEL_ID to an accessible model.
+EOF
+    return 1
+  fi
+}
+
+download_checkpoint "$MODEL_ID" "$MODEL_PATH" "$MODEL_REVISION" "base model"
+download_checkpoint "$EMBEDDING_ID" "$EMBEDDING_PATH" "$EMBEDDING_REVISION" "embedding model"
+
+if [[ "$BOOTSTRAP_ONLY" == "1" ]]; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "Bootstrap dry-run completed. Environment would be: $VENV_DIR"
+  else
+    echo "Bootstrap completed. Environment: $VENV_DIR"
+  fi
+  echo "Base model: $MODEL_PATH"
+  echo "Embedding model: $EMBEDDING_PATH"
+  exit 0
+fi
 
 if [[ -n "${RUN_DIR:-}" ]]; then
-  RUN_DIR="$(cd "$(dirname "$RUN_DIR")" && pwd)/$(basename "$RUN_DIR")"
+  RUN_DIR="$(absolute_path "$RUN_DIR")"
   RUN_ID="${RUN_ID:-$(basename "$RUN_DIR" | sed 's/^phase1_main_//')}"
 else
   RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -112,14 +268,23 @@ stage_preflight() {
     return 0
   fi
   [[ -d "$MODEL_PATH" ]] || { echo "MODEL_PATH not found: $MODEL_PATH" >&2; return 1; }
+  [[ -f "$MODEL_PATH/config.json" ]] || { echo "MODEL_PATH is not a Transformers checkpoint: $MODEL_PATH" >&2; return 1; }
   [[ -d "$EMBEDDING_PATH" ]] || { echo "EMBEDDING_PATH not found: $EMBEDDING_PATH" >&2; return 1; }
+  [[ -f "$EMBEDDING_PATH/modules.json" || -f "$EMBEDDING_PATH/config.json" ]] || { echo "EMBEDDING_PATH is not a local Sentence Transformers checkpoint: $EMBEDDING_PATH" >&2; return 1; }
   python -c 'import torch, transformers, datasets, sentence_transformers; print("torch", torch.__version__); print("transformers", transformers.__version__); print("cuda", torch.cuda.is_available())'
+  if [[ "$DEVICE" == cuda* ]]; then
+    python -c 'import sys, torch; sys.exit("CUDA is required for the KIVI Triton kernels, but torch.cuda.is_available() is false") if not torch.cuda.is_available() else None'
+  fi
   python -c 'from src.kivi_adapter import KIVIConfig; print("KIVI adapter import: OK", KIVIConfig(4, 4, 32, 32))'
   {
     echo "run_id=$RUN_ID"
     echo "model_name=$MODEL_NAME"
+    echo "model_id=$MODEL_ID"
     echo "model_path=$MODEL_PATH"
+    echo "model_revision=$MODEL_REVISION"
+    echo "embedding_id=$EMBEDDING_ID"
     echo "embedding_path=$EMBEDDING_PATH"
+    echo "embedding_revision=$EMBEDDING_REVISION"
     echo "device=$DEVICE"
     echo "dtype=$DTYPE"
     echo "seed=$SEED"

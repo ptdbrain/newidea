@@ -54,6 +54,7 @@ logs/
 # Environment
 .env
 .venv
+.models/
 env/
 venv/
 ENV/

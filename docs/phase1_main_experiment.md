@@ -17,38 +17,56 @@ có thể bật bằng cùng một lệnh.
 
 ## Lệnh chính thức
 
-Sau khi checkout repo và cài dependencies:
+Sau khi checkout repo, trên máy Linux có GPU CUDA chạy:
 
 ```bash
-cd /workspace/newidea && MODEL_PATH=/abs/path/to/Llama-3.2-1B EMBEDDING_PATH=/abs/path/to/all-mpnet-base-v2 RUN_COLLISION_PLUS=1 bash scripts/run_phase1_main.sh
+cd /workspace/newidea
+export HF_TOKEN=hf_...  # Llama-3.2-1B yêu cầu quyền truy cập Hugging Face
+RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
-Trên máy hiện tại, lệnh tương ứng là:
+`scripts/run_phase_1` tự tạo `.venv`, cài `requirements.txt`, init
+`third_party/KIVI`, tải `meta-llama/Llama-3.2-1B` và
+`sentence-transformers/all-mpnet-base-v2` vào `.models/`, rồi chạy toàn bộ
+pipeline. Chạy lại cùng lệnh sẽ dùng lại các dependency/checkpoint đã có.
+
+Nếu đã có checkpoint local, truyền path để bỏ qua download tương ứng:
 
 ```bash
-cd /workspace/newidea && RUN_COLLISION_PLUS=1 bash scripts/run_phase1_main.sh
+MODEL_PATH=/abs/path/to/Llama-3.2-1B \
+EMBEDDING_PATH=/abs/path/to/all-mpnet-base-v2 \
+RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
-Không cần truyền Hugging Face token cho revision public mặc định. Nếu dùng
-mirror/dataset khác, phải thay cả `SOURCE_DATASET` và `SOURCE_REVISION`,
+Dataset revision public mặc định không cần token. Nếu dùng mirror/dataset
+khác, phải thay cả `SOURCE_DATASET` và `SOURCE_REVISION`,
 đồng thời ghi nhận license/provenance trước khi diễn giải kết quả.
 
 `RUN_COLLISION_PLUS=1` làm thêm calibration CPA cho từng condition; đây là
 bước tốn thời gian nhất. Nếu chỉ cần main Protocol-A screening, bỏ biến này:
 
 ```bash
-cd /workspace/newidea && bash scripts/run_phase1_main.sh
+cd /workspace/newidea && bash scripts/run_phase_1
 ```
 
-## Chuẩn bị môi trường
+## Bootstrap riêng
+
+Có thể chỉ chuẩn bị environment và model trước bằng:
 
 ```bash
-pip install -r requirements.txt
-git submodule update --init --recursive
-pytest -q
+bash scripts/run_phase_1 --bootstrap-only
 ```
 
-Model và embedding phải là local path, không phải model-weight quantized:
+Muốn dùng một model Hugging Face public khác, đổi `MODEL_ID` và giữ
+`MODEL_NAME` là một cấu hình đã được hỗ trợ trong `src/config.py`, hoặc bổ sung
+cấu hình batch tương ứng:
+
+```bash
+MODEL_ID=... MODEL_NAME=Llama-3.2-1B bash scripts/run_phase_1
+```
+
+Model và embedding phải là checkpoint đầy đủ, không phải model-weight
+quantized:
 
 ```text
 MODEL_PATH     = checkpoint Llama-3.2-1B FP16/BF16/FP32 nguyên bản
@@ -57,9 +75,8 @@ DEVICE         = cuda:0 (khuyến nghị cho Collision)
 DTYPE          = float16
 ```
 
-Launcher không tải model thay người chạy và không dùng token bí mật từ
-environment snapshot. Nếu máy không dùng `/root/model/...`, bắt buộc đặt
-`MODEL_PATH` và `EMBEDDING_PATH` như lệnh đầu tiên.
+`HF_TOKEN` chỉ được dùng bởi Hugging Face Hub trong lúc tải và không được ghi
+vào `environment.txt`; launcher cũng không đưa secret vào log.
 
 ## Những gì lệnh thực hiện
 
@@ -128,10 +145,10 @@ cat logs/phase1_main_<timestamp>/FINAL_STATUS.txt
 cat logs/phase1_main_<timestamp>/aggregate/summary.md
 ```
 
-Dry-run không download, load model hay sửa artifact:
+Dry-run không cài package, download, load model hay sửa artifact:
 
 ```bash
-DRY_RUN=1 bash scripts/run_phase1_main.sh
+DRY_RUN=1 bash scripts/run_phase_1
 ```
 
 ## Diễn giải đúng phạm vi

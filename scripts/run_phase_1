@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Compatibility entrypoint for the one-command Phase 1 runner.
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$SCRIPT_DIR/run_phase1_main.sh" "$@"

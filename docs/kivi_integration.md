@@ -7,7 +7,8 @@ experiments.
 
 ## Environment
 
-Install the KV-Cloak requirements first. KIVI has a separate, older
+The Phase 1 launcher performs this setup automatically. For manual work,
+install the KV-Cloak requirements first. KIVI has a separate, older
 requirements file and should not be installed wholesale into the same
 environment. The adapter adds the local submodule to the import path when it
 is present, so these commands are also sufficient for a normal checkout:

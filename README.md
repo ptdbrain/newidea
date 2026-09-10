@@ -65,31 +65,28 @@ User Input → [Model] → KV-Cache → [KV-Cloak] → Protected Cache
 
 ## Quick Start
 
-### 1. Setup Environment
+### 1. Setup Environment and Download Checkpoints
 
 ```bash
-conda create --name kvcloak python=3.10 -y
-conda activate kvcloak
-pip install -r requirements.txt
+cd /workspace/newidea
+export HF_TOKEN=hf_...  # required for the gated Llama checkpoint
+bash scripts/run_phase_1 --bootstrap-only
 ```
 
-### 2. Download Model & Dataset
+The launcher creates `.venv`, installs `requirements.txt`, initializes the
+KIVI submodule, and downloads the Llama and MPNet checkpoints under `.models/`.
+Use `MODEL_ID`, `MODEL_PATH`, or `EMBEDDING_PATH` to select existing or
+different authorized checkpoints.
+
+### 2. Run Complete Workflow
 
 ```bash
-# Download model
-huggingface-cli download meta-llama/Llama-3.2-1B --local-dir ~/model/Llama-3.2-1B
+source .venv/bin/activate
 
-# Dataset already included in repo
-ls dataset/
-# alpaca_1k.jsonl  gsm8k_1k.jsonl  lmsys-chat-1m_1k.jsonl
-```
-
-### 3. Run Complete Workflow
-
-```bash
 # Generate KV-cache (20 samples for quick test)
 python inference/get_kvcache.py \
   --model-name Llama-3.2-1B \
+  --model-path .models/Llama-3.2-1B \
   --dataset ./dataset/lmsys-chat-1m_1k.jsonl \
   --dtype float32 \
   --device cuda:0 \
@@ -98,6 +95,8 @@ python inference/get_kvcache.py \
 # Run attacks on unprotected cache
 python attack/attacks.py \
   --target-model-name Llama-3.2-1B \
+  --base-model-path .models/Llama-3.2-1B \
+  --eval-model-path .models/all-mpnet-base-v2 \
   --dataset-path ./dataset/lmsys-chat-1m_1k.jsonl \
   --protect-type origin \
   --i-understand-risks \
@@ -114,6 +113,8 @@ python defense/core/kvcloak.py \
 # Run attacks on protected cache
 python attack/attacks.py \
   --target-model-name Llama-3.2-1B \
+  --base-model-path .models/Llama-3.2-1B \
+  --eval-model-path .models/all-mpnet-base-v2 \
   --dataset-path ./dataset/lmsys-chat-1m_1k.jsonl \
   --protect-type kvcloak \
   --i-understand-risks \
@@ -140,12 +141,12 @@ single-command launcher documented in
 [`docs/phase1_main_experiment.md`](docs/phase1_main_experiment.md):
 
 ```bash
-cd /workspace/newidea && RUN_COLLISION_PLUS=1 bash scripts/run_phase1_main.sh
+cd /workspace/newidea && RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
-Set `MODEL_PATH` and `EMBEDDING_PATH` when local checkpoints are not under
-`/root/model/`. The launcher writes a timestamped run bundle and supports
-`RESUME=1 RUN_DIR=...`.
+Set `MODEL_PATH` and `EMBEDDING_PATH` only when using checkpoints outside the
+default `.models/` directory. The launcher writes a timestamped run bundle
+and supports `RESUME=1 RUN_DIR=...`.
 
 ---
 
