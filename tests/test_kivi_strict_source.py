@@ -25,14 +25,17 @@ def test_batch_processor_strict_mode_rejects_missing_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     kivi_kvcache = _load_kivi_batch_module_without_kernels(monkeypatch)
-    cache_root = tmp_path / "cache"
-    (cache_root / "sample-a").mkdir(parents=True)
+    try:
+        cache_root = tmp_path / "cache"
+        (cache_root / "sample-a").mkdir(parents=True)
 
-    with pytest.raises(FileNotFoundError, match=r"sample-a.*past_key_values\.pt"):
-        kivi_kvcache.process_cache_directory(
-            cache_root,
-            object(),
-            output_protect_type="kivi-test",
-            device="cpu",
-            strict=True,
-        )
+        with pytest.raises(FileNotFoundError, match=r"sample-a.*past_key_values\.pt"):
+            kivi_kvcache.process_cache_directory(
+                cache_root,
+                object(),
+                output_protect_type="kivi-test",
+                device="cpu",
+                strict=True,
+            )
+    finally:
+        sys.modules.pop("defense.baseline.kivi_kvcache", None)
