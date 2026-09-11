@@ -9,6 +9,51 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 
+def normalize_past_key_values(
+    cache,
+    *,
+    dtype: torch.dtype,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Convert modern or legacy model caches to canonical CPU layer tuples."""
+    if cache is None:
+        raise ValueError("past_key_values is missing")
+    if hasattr(cache, "to_legacy_cache"):
+        cache = cache.to_legacy_cache()
+
+    layers = tuple(cache)
+    if not layers:
+        raise ValueError("past_key_values contains no layers")
+
+    normalized: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_index, layer in enumerate(layers):
+        if len(layer) != 2:
+            raise ValueError(
+                f"cache layer {layer_index} must contain exactly key and value"
+            )
+        key, value = layer
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            raise TypeError(f"cache layer {layer_index} must contain tensors")
+        if key.ndim != 4 or value.ndim != 4:
+            raise ValueError(
+                f"cache layer {layer_index} must have shape [B, H, T, D]"
+            )
+        if key.shape != value.shape:
+            raise ValueError(f"cache layer {layer_index} key/value shapes differ")
+        if not key.dtype.is_floating_point or not value.dtype.is_floating_point:
+            raise TypeError(f"cache layer {layer_index} must be floating point")
+        if not bool(torch.isfinite(key).all()) or not bool(torch.isfinite(value).all()):
+            raise FloatingPointError(
+                f"cache layer {layer_index} contains non-finite values"
+            )
+        normalized.append(
+            (
+                key.detach().to(device="cpu", dtype=dtype),
+                value.detach().to(device="cpu", dtype=dtype),
+            )
+        )
+    return tuple(normalized)
+
+
 def prefill(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -46,11 +91,9 @@ def prefill(
             output_attentions=save_intermediates,
         )
 
-    past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
-
-    past_key_values = tuple(
-        (k.to(device="cpu", dtype=dtype), v.to(device="cpu", dtype=dtype))
-        for (k, v) in past_key_values
+    past_key_values = normalize_past_key_values(
+        outputs.past_key_values,
+        dtype=dtype,
     )
     # Save the canonical cache. The optional tensors are useful for legacy
     # analysis but are not needed by the Phase 1 attack/storage pipeline.
