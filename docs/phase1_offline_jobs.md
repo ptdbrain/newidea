@@ -23,3 +23,17 @@ or separate upload is needed.
 Use `SKIP_BOOTSTRAP=1` when the job already has the Python environment and
 local model checkpoints. The launcher will fail early if the KIVI source or
 commit manifest is missing.
+
+## Prefill failure guarantees
+
+- Checkpoint validation fails before model loading when local model or
+  tokenizer assets are incomplete.
+- A sample prefill error stops the stage and preserves the original exception.
+- `prefill.done` is written only after every dataset row has an Origin cache.
+- KIVI materialization fails immediately when an Origin source cache is
+  missing.
+- After correcting a failed prefill, use a new `RUN_ID`; do not resume a run
+  whose prefill marker was created by an older launcher.
+
+These checks prove artifact completeness. A real GPU run is still required to
+validate the model-specific Transformers and CUDA execution path.
