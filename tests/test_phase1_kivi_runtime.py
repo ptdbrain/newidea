@@ -97,6 +97,7 @@ def test_offline_entrypoint_extracts_bundle_and_skips_bootstrap() -> None:
     )
 
     assert "PHASE1_KIVI_BUNDLE" in entrypoint
+    assert "phase1-kivi-bundle.tar.gz" in entrypoint
     assert "tar -xzf" in entrypoint
     assert "export SKIP_BOOTSTRAP=1" in entrypoint
     assert 'exec bash "$REPO_ROOT/scripts/run_phase1_main.sh" "$@"' in entrypoint

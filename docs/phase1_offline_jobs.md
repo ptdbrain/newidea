@@ -7,16 +7,18 @@ network access. Prepare the KIVI source once on a machine with Git:
 bash scripts/prepare_phase1_kivi_bundle.sh
 ```
 
-Upload the generated `phase1-kivi-bundle-<commit>.tar.gz` to the job input
-directory. The one-command offline entrypoint extracts it when needed:
+Upload the generated `phase1-kivi-bundle.tar.gz` to the job input directory.
+The one-command offline entrypoint extracts it when needed:
 
 ```bash
-PHASE1_KIVI_BUNDLE=/path/to/phase1-kivi-bundle-<commit>.tar.gz \
+PHASE1_KIVI_BUNDLE=/path/to/phase1-kivi-bundle.tar.gz \
   bash scripts/run_phase1_offline.sh
 ```
 
 The bundle contains the pinned KIVI source and `third_party/KIVI.commit`; the
 launcher then uses that staged source without invoking Git.
+When the bundle is committed at the repository root, no environment variable
+or separate upload is needed.
 
 Use `SKIP_BOOTSTRAP=1` when the job already has the Python environment and
 local model checkpoints. The launcher will fail early if the KIVI source or

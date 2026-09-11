@@ -30,7 +30,7 @@ expected_commit="$(python -c 'from src.provenance import KIVI_COMMIT; print(KIVI
 }
 
 printf '%s\n' "$actual_commit" > "$COMMIT_FILE"
-BUNDLE_PATH="${1:-$REPO_ROOT/phase1-kivi-bundle-${actual_commit}.tar.gz}"
+BUNDLE_PATH="${1:-$REPO_ROOT/phase1-kivi-bundle.tar.gz}"
 if [[ "$BUNDLE_PATH" != /* ]]; then
   BUNDLE_PATH="$REPO_ROOT/$BUNDLE_PATH"
 fi

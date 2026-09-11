@@ -10,13 +10,17 @@ KIVI_ENTRYPOINT="$REPO_ROOT/third_party/KIVI/quant/new_pack.py"
 if [[ ! -f "$KIVI_ENTRYPOINT" ]]; then
   BUNDLE_PATH="${PHASE1_KIVI_BUNDLE:-}"
   if [[ -z "$BUNDLE_PATH" ]]; then
-    shopt -s nullglob
-    bundles=("$REPO_ROOT"/phase1-kivi-bundle-*.tar.gz)
-    if [[ "${#bundles[@]}" -eq 1 ]]; then
-      BUNDLE_PATH="${bundles[0]}"
+    if [[ -f "$REPO_ROOT/phase1-kivi-bundle.tar.gz" ]]; then
+      BUNDLE_PATH="$REPO_ROOT/phase1-kivi-bundle.tar.gz"
     else
-      echo "Set PHASE1_KIVI_BUNDLE to the offline KIVI bundle." >&2
-      exit 1
+      shopt -s nullglob
+      bundles=("$REPO_ROOT"/phase1-kivi-bundle-*.tar.gz)
+      if [[ "${#bundles[@]}" -eq 1 ]]; then
+        BUNDLE_PATH="${bundles[0]}"
+      else
+        echo "Set PHASE1_KIVI_BUNDLE to the offline KIVI bundle." >&2
+        exit 1
+      fi
     fi
   fi
   [[ -f "$BUNDLE_PATH" ]] || {
