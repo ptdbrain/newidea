@@ -86,6 +86,58 @@ def extract_user_input(item: dict, dataset_filename: str) -> str | None:
     return None
 
 
+def process_dataset_records(
+    model,
+    tokenizer,
+    dataset: list[dict],
+    dataset_path: Path,
+    cache_root: Path,
+    *,
+    minimal_cache: bool,
+    prefill_fn=prefill,
+) -> int:
+    """Generate one canonical Origin cache per record or fail immediately."""
+    generated = 0
+    for index, item in enumerate(
+        tqdm(dataset, desc=f"Processing {dataset_path.name}")
+    ):
+        sample_id = str(item.get("sample_id", f"index-{index}"))
+        user_input = extract_user_input(item, dataset_path.name)
+        if not user_input:
+            raise RuntimeError(
+                f"prefill failed for sample {sample_id}: no usable prompt"
+            )
+
+        input_hash = hashlib.sha1(user_input.encode("utf-8")).hexdigest()
+        cache_dir = cache_root / input_hash
+        try:
+            prefill_fn(
+                model,
+                tokenizer,
+                user_input,
+                cache_dir,
+                save_intermediates=not minimal_cache,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"prefill failed for sample {sample_id} at {cache_dir}: {error}"
+            ) from error
+
+        canonical_path = cache_dir / "origin" / "past_key_values.pt"
+        if not canonical_path.is_file():
+            raise RuntimeError(
+                f"prefill produced no canonical cache for sample {sample_id}: "
+                f"{canonical_path}"
+            )
+        generated += 1
+
+    if generated != len(dataset):
+        raise RuntimeError(
+            f"prefill incomplete: expected {len(dataset)}, generated {generated}"
+        )
+    return generated
+
+
 def main(
     model_name: str,
     device: torch.device,
@@ -143,42 +195,18 @@ def main(
         f"cache/{dtype_name}/{dataset_path.stem}/{model_name}/"
     )
 
-    dataset_filename = dataset_path.name
-    for i, item in enumerate(tqdm(dataset, desc=f"Processing {dataset_path.name}")):
-        try:
-            user_input = extract_user_input(item, dataset_filename)
-            if user_input is None and not (
-                dataset_filename in {"lmsys-chat-1m_1k.jsonl", "gsm8k_1k.jsonl", "alpaca_1k.jsonl"}
-            ):
-                print(
-                    f"Warning: Unknown dataset format for {dataset_filename}. Skipping sample {i}."
-                )
-                continue
-
-            if user_input:
-                input_hash = hashlib.sha1(user_input.encode("utf-8")).hexdigest()
-                cache_dir = base_cache_dir_parent / input_hash
-
-                prefill(
-                    model,
-                    tokenizer,
-                    user_input,
-                    cache_dir,
-                    save_intermediates=not minimal_cache,
-                )
-            else:
-                print(
-                    f"Warning: No user input extracted for sample {i} in {dataset_filename}. Skipping."
-                )
-
-        except Exception as e:
-            print(
-                f"An error occurred while processing sample {i} from {dataset_filename}: {e}"
-            )
-            continue
+    generated = process_dataset_records(
+        model,
+        tokenizer,
+        dataset,
+        dataset_path,
+        base_cache_dir_parent,
+        minimal_cache=minimal_cache,
+    )
 
     print(
-        f"\nFinished processing {dataset_path.name}. KV-Cache data saved in '{base_cache_dir_parent}'"
+        f"\nFinished processing {generated} samples from {dataset_path.name}. "
+        f"KV-Cache data saved in '{base_cache_dir_parent}'"
     )
 
 

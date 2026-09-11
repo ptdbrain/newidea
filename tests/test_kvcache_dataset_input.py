@@ -7,7 +7,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "inference"))
 
-from get_kvcache import extract_user_input, validate_local_checkpoint  # noqa: E402
+from get_kvcache import (  # noqa: E402
+    extract_user_input,
+    process_dataset_records,
+    validate_local_checkpoint,
+)
 
 
 def _complete_checkpoint(root: Path) -> Path:
@@ -38,3 +42,51 @@ def test_extract_user_input_prefers_normalized_prompt_field():
 def test_extract_user_input_supports_lmsys_messages():
     record = {"messages": [{"role": "user", "content": "hello"}]}
     assert extract_user_input(record, "phase1.jsonl") == "hello"
+
+
+def test_process_dataset_records_propagates_sample_failure(tmp_path: Path) -> None:
+    dataset = [{"sample_id": "prompt-1", "prompt": "hello"}]
+
+    def failing_prefill(*args, **kwargs):
+        raise ValueError("bad cache format")
+
+    with pytest.raises(RuntimeError, match="prompt-1.*bad cache format") as raised:
+        process_dataset_records(
+            object(),
+            object(),
+            dataset,
+            Path("phase1.jsonl"),
+            tmp_path,
+            minimal_cache=True,
+            prefill_fn=failing_prefill,
+        )
+
+    assert isinstance(raised.value.__cause__, ValueError)
+
+
+def test_process_dataset_records_rejects_missing_prompt(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="prompt-1.*no usable prompt"):
+        process_dataset_records(
+            object(),
+            object(),
+            [{"sample_id": "prompt-1"}],
+            Path("phase1.jsonl"),
+            tmp_path,
+            minimal_cache=True,
+        )
+
+
+def test_process_dataset_records_requires_canonical_cache_file(tmp_path: Path) -> None:
+    def prefill_without_artifact(*args, **kwargs):
+        return (), None
+
+    with pytest.raises(RuntimeError, match="produced no canonical cache"):
+        process_dataset_records(
+            object(),
+            object(),
+            [{"sample_id": "prompt-1", "prompt": "hello"}],
+            Path("phase1.jsonl"),
+            tmp_path,
+            minimal_cache=True,
+            prefill_fn=prefill_without_artifact,
+        )
