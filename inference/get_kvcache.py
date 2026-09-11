@@ -9,6 +9,36 @@ from tqdm import tqdm
 from pdsplit import prefill
 
 
+def validate_local_checkpoint(model_path: Path) -> None:
+    """Reject incomplete offline model checkpoints before loading begins."""
+    model_path = Path(model_path)
+    if not model_path.is_dir():
+        raise FileNotFoundError(f"model checkpoint directory not found: {model_path}")
+
+    missing: list[str] = []
+    if not (model_path / "config.json").is_file():
+        missing.append("config.json")
+    weight_files = [
+        path
+        for pattern in ("*.safetensors", "*.bin", "*.pt")
+        for path in model_path.glob(pattern)
+    ]
+    if not weight_files:
+        missing.append("model weights (*.safetensors, *.bin, or *.pt)")
+    if not (model_path / "tokenizer_config.json").is_file():
+        missing.append("tokenizer_config.json")
+    if not any(
+        (model_path / name).is_file() for name in ("tokenizer.json", "tokenizer.model")
+    ):
+        missing.append("tokenizer.json or tokenizer.model")
+
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete local model checkpoint at {model_path}: "
+            f"missing {', '.join(missing)}"
+        )
+
+
 def extract_user_input(item: dict, dataset_filename: str) -> str | None:
     """Extract the canonical prompt from normalized or legacy dataset rows."""
     prompt = item.get("prompt")
@@ -75,17 +105,20 @@ def main(
     )
     dataset_path = Path(dataset_name)
 
-    if not model_path.is_dir():
-        print(f"Warning: Model path does not exist, skipping: {model_path}")
-        return
+    validate_local_checkpoint(model_path)
     if not dataset_path.is_file():
         print(f"Warning: Dataset path does not exist, skipping: {dataset_path}")
         return
 
     print(f"Loading tokenizer and model: {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=True, local_files_only=True
+    )
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, attn_implementation="eager"
+        model_path,
+        trust_remote_code=True,
+        attn_implementation="eager",
+        local_files_only=True,
     ).to(device, dtype)
     model.eval()
     print("Model loaded successfully.")
