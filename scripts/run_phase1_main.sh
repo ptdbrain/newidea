@@ -63,6 +63,12 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# KIVI may be staged by the submit-side packaging step rather than initialized
+# on the compute node.  The runtime helper keeps that path Git-free.
+source "$REPO_ROOT/scripts/phase1_kivi_runtime.sh"
+KIVI_ROOT="$REPO_ROOT/third_party/KIVI"
+KIVI_COMMIT_FILE="${KIVI_COMMIT_FILE:-$REPO_ROOT/third_party/KIVI.commit}"
+
 MODEL_NAME="${MODEL_NAME:-Llama-3.2-1B}"
 MODEL_ID="${MODEL_ID:-meta-llama/Llama-3.2-1B}"
 MODEL_ROOT="${MODEL_ROOT:-$REPO_ROOT/.models}"
@@ -106,11 +112,11 @@ absolute_path() {
 MODEL_PATH="$(absolute_path "$MODEL_PATH")"
 EMBEDDING_PATH="$(absolute_path "$EMBEDDING_PATH")"
 
+if [[ "$DRY_RUN" != "1" ]]; then
+  phase1_kivi_prepare "$REPO_ROOT" "$KIVI_ROOT" "$KIVI_COMMIT_FILE"
+fi
+
 if [[ "$SKIP_BOOTSTRAP" != "1" && "$DRY_RUN" != "1" ]]; then
-  command -v git >/dev/null 2>&1 || {
-    echo "git is required to initialize third_party/KIVI." >&2
-    exit 1
-  }
   HOST_PYTHON="${PYTHON:-}"
   if [[ -z "$HOST_PYTHON" ]]; then
     HOST_PYTHON="$(command -v python3 || command -v python || true)"
@@ -137,8 +143,6 @@ if [[ "$SKIP_BOOTSTRAP" != "1" && "$DRY_RUN" != "1" ]]; then
   else
     echo "[bootstrap] Python dependencies already match requirements.txt"
   fi
-  echo "[bootstrap] initializing third_party/KIVI"
-  git submodule update --init --recursive
 else
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "[dry-run] would create/reuse $VENV_DIR, install requirements.txt, initialize KIVI, and download checkpoints"
@@ -223,7 +227,7 @@ CACHE_ROOT="$REPO_ROOT/cache/$DTYPE/$(basename "${DATASET_PATH%.jsonl}")/$MODEL_
 RAW_DIR="$RUN_DIR/raw_attacks"
 AGG_DIR="$RUN_DIR/aggregate"
 
-export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/third_party/KIVI${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT:$KIVI_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONHASHSEED="$SEED"
 
 if [[ "$DRY_RUN" != "1" ]]; then
@@ -293,9 +297,15 @@ stage_preflight() {
     echo "cache_root=$CACHE_ROOT"
     python --version
     python -c 'import torch; print("torch=" + torch.__version__); print("cuda=" + str(torch.version.cuda)); print("cuda_available=" + str(torch.cuda.is_available()))'
-    git rev-parse HEAD
-    git -C third_party/KIVI rev-parse HEAD
-    git status --short
+    echo "project_commit=$(phase1_project_commit "$REPO_ROOT")"
+    echo "kivi_commit=$(phase1_kivi_commit "$KIVI_ROOT" "$KIVI_COMMIT_FILE")"
+    if command -v git >/dev/null 2>&1; then
+      if ! git -C "$REPO_ROOT" status --short 2>/dev/null; then
+        echo "git_status=unavailable"
+      fi
+    else
+      echo "git_status=unavailable"
+    fi
     if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi; fi
   } > "$RUN_DIR/environment.txt"
   (

@@ -55,6 +55,8 @@ logs/
 .env
 .venv
 .models/
+third_party/KIVI.commit
+phase1-kivi-bundle-*.tar.gz
 env/
 venv/
 ENV/
