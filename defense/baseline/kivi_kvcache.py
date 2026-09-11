@@ -91,6 +91,7 @@ def process_cache_directory(
     dtype: torch.dtype | None = torch.float16,
     start_index: int = 0,
     end_index: int | None = None,
+    strict: bool = False,
 ) -> list[Path]:
     """Process every cached sample below ``cache_root``.
 
@@ -114,6 +115,10 @@ def process_cache_directory(
     for sample_dir in tqdm(sample_dirs, desc=f"Processing {output_protect_type}"):
         source_path = sample_dir / source_protect_type / "past_key_values.pt"
         if not source_path.is_file():
+            if strict:
+                raise FileNotFoundError(
+                    f"missing source cache for {sample_dir.name}: {source_path}"
+                )
             print(f"Warning: source KV cache not found at {source_path}")
             continue
 
@@ -154,6 +159,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=None)
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail immediately when a selected sample has no source cache.",
+    )
     args = parser.parse_args()
 
     config = KIVIConfig(
@@ -180,6 +190,7 @@ def main() -> None:
         dtype=getattr(torch, args.dtype),
         start_index=args.start_index,
         end_index=args.end_index,
+        strict=args.strict,
     )
 
 
