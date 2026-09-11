@@ -356,43 +356,46 @@ git commit -m "fix(kivi): reject missing source caches"
 ### Task 5: Enforce the Phase 1 launcher artifact contract
 
 **Files:**
+- Modify: `scripts/phase1_kivi_runtime.sh`
 - Modify: `scripts/run_phase1_main.sh:334-349`
 - Modify: `tests/test_phase1_kivi_runtime.py`
 
 **Interfaces:**
+- Produces: `phase1_verify_origin_caches(dataset_path, cache_root)` Bash function
 - Consumes: Task 3 canonical cache layout
 - Consumes: Task 4 `--strict` CLI flag
 - Produces: a prefill stage that succeeds only when expected and actual Origin counts match
 
-- [ ] **Step 1: Write failing launcher contract assertions**
+- [ ] **Step 1: Write failing cache-contract behavior tests**
 
 ```python
-def test_launcher_requires_complete_origin_cache_set():
-    launcher = (Path(__file__).parents[1] / "scripts" / "run_phase1_main.sh").read_text()
-    assert "prefill incomplete: expected" in launcher
-    assert 'find "$CACHE_ROOT" -path \'*/origin/past_key_values.pt\'' in launcher
-    assert launcher.count("--strict") == 4
+def test_origin_cache_verifier_rejects_partial_prefill(tmp_path):
+    dataset_path = tmp_path / "phase1.jsonl"
+    dataset_path.write_text('{"prompt":"one"}\n{"prompt":"two"}\n')
+    origin = tmp_path / "cache" / "sample-one" / "origin"
+    origin.mkdir(parents=True)
+    (origin / "past_key_values.pt").write_bytes(b"cache")
+
+    result = run_cache_verifier(dataset_path, tmp_path / "cache")
+
+    assert result.returncode != 0
+    assert "expected 2 origin caches, found 1" in result.stderr
 ```
 
 - [ ] **Step 2: Run test and verify RED**
 
 Run: `pytest tests/test_phase1_kivi_runtime.py::test_launcher_requires_complete_origin_cache_set -q`
 
-Expected: assertion failure because the count gate and strict flags are absent.
+Expected: failure because `phase1_verify_origin_caches` does not exist.
 
 - [ ] **Step 3: Add the launcher count gate and strict flags**
 
-After `inference/get_kvcache.py` returns in `stage_prefill`, calculate:
+Implement `phase1_verify_origin_caches` with Bash built-ins and a nullglob array
+over `"$cache_root"/*/origin/past_key_values.pt`. After
+`inference/get_kvcache.py` returns in `stage_prefill`, call:
 
 ```bash
-local expected_count
-local actual_count
-expected_count="$(grep -cve '^[[:space:]]*$' "$DATASET_PATH")"
-actual_count="$(find "$CACHE_ROOT" -path '*/origin/past_key_values.pt' -type f | wc -l)"
-if [[ "$actual_count" -ne "$expected_count" ]]; then
-  echo "prefill incomplete: expected $expected_count origin caches, found $actual_count under $CACHE_ROOT" >&2
-  return 1
-fi
+phase1_verify_origin_caches "$DATASET_PATH" "$CACHE_ROOT"
 ```
 
 Append `--strict` to each of the four KIVI materialization commands.
@@ -408,7 +411,7 @@ Expected: all tests pass and Bash exits zero.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/run_phase1_main.sh tests/test_phase1_kivi_runtime.py
+git add scripts/phase1_kivi_runtime.sh scripts/run_phase1_main.sh tests/test_phase1_kivi_runtime.py
 git commit -m "fix(runner): gate incomplete prefill"
 ```
 

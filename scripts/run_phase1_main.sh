@@ -340,13 +340,14 @@ stage_prefill() {
     --device "$DEVICE" \
     --max-samples 100 \
     --minimal-cache
+  phase1_verify_origin_caches "$DATASET_PATH" "$CACHE_ROOT"
 }
 
 stage_materialize() {
-  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 4 --v-bits 4 --group-size 32 --residual-length 32 --mode standard
-  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 4 --v-bits 4 --group-size 32 --residual-length 32 --mode full_prompt_quantized
-  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 2 --v-bits 2 --group-size 32 --residual-length 32 --mode standard
-  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 2 --v-bits 2 --group-size 32 --residual-length 32 --mode full_prompt_quantized
+  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 4 --v-bits 4 --group-size 32 --residual-length 32 --mode standard --strict
+  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 4 --v-bits 4 --group-size 32 --residual-length 32 --mode full_prompt_quantized --strict
+  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 2 --v-bits 2 --group-size 32 --residual-length 32 --mode standard --strict
+  python defense/baseline/kivi_kvcache.py --model-name "$MODEL_NAME" --dataset-path "$DATASET_PATH" --cache-root "$CACHE_ROOT" --dtype "$DTYPE" --device "$DEVICE" --k-bits 2 --v-bits 2 --group-size 32 --residual-length 32 --mode full_prompt_quantized --strict
 }
 
 stage_validate_cache() {

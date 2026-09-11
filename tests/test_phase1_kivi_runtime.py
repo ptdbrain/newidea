@@ -43,6 +43,32 @@ def _run_helper(helper: Path, *args: Path | str, path: str = "") -> subprocess.C
     )
 
 
+def _run_cache_verifier(
+    helper: Path, dataset_path: Path, cache_root: Path
+) -> subprocess.CompletedProcess[str]:
+    bash = shutil.which("bash")
+    if os.name == "nt":
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if git_bash.is_file():
+            bash = str(git_bash)
+    if bash is None:
+        raise RuntimeError("bash is required for the shell-helper tests")
+    return subprocess.run(
+        [
+            bash,
+            "-c",
+            'source "$1"; phase1_verify_origin_caches "$2" "$3"',
+            "phase1-cache-test",
+            _bash_path(helper),
+            _bash_path(dataset_path),
+            _bash_path(cache_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_pre_staged_kivi_does_not_require_git(tmp_path: Path) -> None:
     repo_root = tmp_path
     kivi_root = repo_root / "third_party" / "KIVI"
@@ -101,3 +127,40 @@ def test_offline_entrypoint_extracts_bundle_and_skips_bootstrap() -> None:
     assert "tar -xzf" in entrypoint
     assert "export SKIP_BOOTSTRAP=1" in entrypoint
     assert 'exec bash "$REPO_ROOT/scripts/run_phase1_main.sh" "$@"' in entrypoint
+
+
+def test_origin_cache_verifier_rejects_partial_prefill(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "phase1.jsonl"
+    dataset_path.write_text('{"prompt":"one"}\n{"prompt":"two"}\n', encoding="utf-8")
+    cache_root = tmp_path / "cache"
+    origin = cache_root / "sample-one" / "origin"
+    origin.mkdir(parents=True)
+    (origin / "past_key_values.pt").write_bytes(b"cache")
+
+    result = _run_cache_verifier(
+        Path(__file__).parents[1] / "scripts" / "phase1_kivi_runtime.sh",
+        dataset_path,
+        cache_root,
+    )
+
+    assert result.returncode != 0
+    assert "expected 2 origin caches, found 1" in result.stderr
+
+
+def test_origin_cache_verifier_accepts_complete_prefill(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "phase1.jsonl"
+    dataset_path.write_text('{"prompt":"one"}\n{"prompt":"two"}\n', encoding="utf-8")
+    cache_root = tmp_path / "cache"
+    for sample_name in ("sample-one", "sample-two"):
+        origin = cache_root / sample_name / "origin"
+        origin.mkdir(parents=True)
+        (origin / "past_key_values.pt").write_bytes(b"cache")
+
+    result = _run_cache_verifier(
+        Path(__file__).parents[1] / "scripts" / "phase1_kivi_runtime.sh",
+        dataset_path,
+        cache_root,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified 2/2 origin caches" in result.stdout

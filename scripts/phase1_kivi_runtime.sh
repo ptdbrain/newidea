@@ -75,3 +75,39 @@ phase1_project_commit() {
     printf 'unavailable\n'
   fi
 }
+
+phase1_verify_origin_caches() (
+  local dataset_path="$1"
+  local cache_root="$2"
+  local expected_count=0
+  local line
+
+  [[ -f "$dataset_path" ]] || {
+    echo "prefill dataset not found: $dataset_path" >&2
+    return 1
+  }
+  [[ -d "$cache_root" ]] || {
+    echo "prefill cache root not found: $cache_root" >&2
+    return 1
+  }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ [^[:space:]] ]]; then
+      expected_count=$((expected_count + 1))
+    fi
+  done < "$dataset_path"
+  if [[ "$expected_count" -eq 0 ]]; then
+    echo "prefill dataset contains no records: $dataset_path" >&2
+    return 1
+  fi
+
+  shopt -s nullglob
+  local cache_files=("$cache_root"/*/origin/past_key_values.pt)
+  local actual_count="${#cache_files[@]}"
+  if [[ "$actual_count" -ne "$expected_count" ]]; then
+    echo "prefill incomplete: expected $expected_count origin caches, found $actual_count under $cache_root" >&2
+    return 1
+  fi
+
+  echo "[prefill] verified $actual_count/$expected_count origin caches"
+)
