@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.9.1-orange.svg)](https://pytorch.org/)
 
 Official implementation of **"Shadow in the Cache: Unveiling and Mitigating Privacy Risks of KV-cache in LLM Inference"** (NDSS 2026)
 
@@ -73,8 +73,16 @@ export HF_TOKEN=hf_...  # required for the gated Llama checkpoint
 bash scripts/run_phase_1 --bootstrap-only
 ```
 
-The launcher creates `.venv`, installs `requirements.txt`, initializes the
-KIVI submodule, and downloads the Llama and MPNet checkpoints under `.models/`.
+The launcher defaults to the official PyTorch 2.9.1 CUDA 12.8 wheel. On a CUDA
+13.0 node, select the matching wheel explicitly:
+
+```bash
+PYTORCH_CUDA_VARIANT=cu130 bash scripts/run_phase_1 --bootstrap-only
+```
+
+The launcher creates `.venv`, installs the selected PyTorch build before
+`requirements.txt`, initializes the KIVI submodule, and downloads the Llama and
+MPNet checkpoints under `.models/`. Only `cu128` and `cu130` are accepted.
 Use `MODEL_ID`, `MODEL_PATH`, or `EMBEDDING_PATH` to select existing or
 different authorized checkpoints.
 
@@ -141,7 +149,7 @@ single-command launcher documented in
 [`docs/phase1_main_experiment.md`](docs/phase1_main_experiment.md):
 
 ```bash
-cd /workspace/newidea && RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
+cd /workspace/newidea && PYTORCH_CUDA_VARIANT=cu128 RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
 Set `MODEL_PATH` and `EMBEDDING_PATH` only when using checkpoints outside the

@@ -12,6 +12,7 @@ The one-command offline entrypoint extracts it when needed:
 
 ```bash
 PHASE1_KIVI_BUNDLE=/path/to/phase1-kivi-bundle.tar.gz \
+PYTORCH_CUDA_VARIANT=cu128 \
   bash scripts/run_phase1_offline.sh
 ```
 
@@ -23,6 +24,13 @@ or separate upload is needed.
 Use `SKIP_BOOTSTRAP=1` when the job already has the Python environment and
 local model checkpoints. The launcher will fail early if the KIVI source or
 commit manifest is missing.
+
+The active Python environment must already contain `torch==2.9.1` built for
+the selected CUDA runtime. Use `PYTORCH_CUDA_VARIANT=cu128` for CUDA 12.8 or
+`PYTORCH_CUDA_VARIANT=cu130` for CUDA 13.0. Offline mode does not download
+Python packages, Torch, models, embeddings, or datasets, and CUDA wheels are
+not stored in Git. Preflight rejects a CPU wheel, a mismatched CUDA build, or a
+KIVI Triton kernel that cannot compile on the assigned GPU.
 
 ## Prefill failure guarantees
 

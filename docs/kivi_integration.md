@@ -14,15 +14,26 @@ environment. The adapter adds the local submodule to the import path when it
 is present, so these commands are also sufficient for a normal checkout:
 
 ```bash
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 git submodule update --init --recursive
 ```
 
+Use the `cu130` index instead on a CUDA 13.0 node. Do not install KIVI's old
+`requirements.txt`; it pins Torch 2.1.2, CUDA 12.1 libraries, and Triton 2.1.0.
+The Phase 1 launcher installs the correct Torch build automatically from
+`PYTORCH_CUDA_VARIANT=cu128` (default) or `cu130`.
+
 The pinned public KIVI kernels require CUDA. Verify the compatibility gate:
 
 ```bash
-pytest -q tests/test_kivi_import.py
+python -m scripts.check_phase1_cuda \
+  --variant cu128 --torch-version 2.9.1 --device cuda:0
 ```
+
+This gate validates the selected Torch/CUDA metadata and executes a real KIVI
+quantize/dequantize roundtrip, so a Triton compile failure stops before cache
+materialization.
 
 ## Cache conditions
 

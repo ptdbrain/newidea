@@ -22,10 +22,21 @@ Sau khi checkout repo, trên máy Linux có GPU CUDA chạy:
 ```bash
 cd /workspace/newidea
 export HF_TOKEN=hf_...  # Llama-3.2-1B yêu cầu quyền truy cập Hugging Face
-RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
+PYTORCH_CUDA_VARIANT=cu128 RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
-`scripts/run_phase_1` tự tạo `.venv`, cài `requirements.txt`, init
+`cu128` là mặc định. Nếu node chạy CUDA 13.0, dùng:
+
+```bash
+PYTORCH_CUDA_VARIANT=cu130 RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
+```
+
+Launcher chỉ chấp nhận `cu128` hoặc `cu130`. Nó cài `torch==2.9.1` từ
+đúng PyTorch index trước `requirements.txt`, rồi chạy một roundtrip KIVI thật
+trên GPU trước khi tạo dataset hoặc cache.
+
+`scripts/run_phase_1` tự tạo `.venv`, cài PyTorch CUDA đã chọn rồi cài
+`requirements.txt`, init
 `third_party/KIVI`, tải `meta-llama/Llama-3.2-1B` và
 `sentence-transformers/all-mpnet-base-v2` vào `.models/`, rồi chạy toàn bộ
 pipeline. Chạy lại cùng lệnh sẽ dùng lại các dependency/checkpoint đã có.
