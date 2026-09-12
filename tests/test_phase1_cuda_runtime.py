@@ -15,6 +15,7 @@ from scripts.check_phase1_cuda import validate_runtime
 
 PROJECT_ROOT = Path(__file__).parents[1]
 CUDA_HELPER = PROJECT_ROOT / "scripts" / "phase1_cuda_runtime.sh"
+PHASE1_LAUNCHER = PROJECT_ROOT / "scripts" / "run_phase1_main.sh"
 
 
 class _FakeCuda:
@@ -90,6 +91,27 @@ printf 'fingerprint=%s\n' "$fingerprint"
         capture_output=True,
         text=True,
     )
+
+
+def _run_launcher(
+    *arguments: str, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    launcher_environment = os.environ.copy()
+    launcher_environment.update(environment or {})
+    return subprocess.run(
+        [_bash(), _bash_path(PHASE1_LAUNCHER), *arguments],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=launcher_environment,
+    )
+
+
+def _write_checkpoint_fixture(path: Path, config_name: str) -> None:
+    path.mkdir(parents=True)
+    (path / config_name).write_text("{}\n", encoding="utf-8")
+    (path / "model.safetensors").write_bytes(b"checkpoint")
 
 
 def test_cuda_variant_mapping_defaults_are_stable(tmp_path: Path) -> None:
@@ -192,3 +214,135 @@ def test_validate_runtime_rejects_unknown_variant() -> None:
             "cu129",
             "2.9.1",
         )
+
+
+def test_launcher_dry_run_defaults_to_cu128() -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={"DRY_RUN": "1", "PYTORCH_CUDA_VARIANT": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PyTorch: 2.9.1 (cu128 / CUDA 12.8)" in result.stdout
+    assert (
+        "PyTorch index: https://download.pytorch.org/whl/cu128" in result.stdout
+    )
+
+
+def test_launcher_dry_run_supports_cu130() -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={"DRY_RUN": "1", "PYTORCH_CUDA_VARIANT": "cu130"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PyTorch: 2.9.1 (cu130 / CUDA 13.0)" in result.stdout
+    assert (
+        "PyTorch index: https://download.pytorch.org/whl/cu130" in result.stdout
+    )
+
+
+def test_launcher_rejects_unsupported_cuda_variant() -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={"DRY_RUN": "1", "PYTORCH_CUDA_VARIANT": "cu129"},
+    )
+
+    assert result.returncode == 2
+    assert "Supported values: cu128, cu130" in result.stderr
+
+
+def test_launcher_installs_torch_before_application_requirements(
+    tmp_path: Path,
+) -> None:
+    venv_dir = tmp_path / "venv"
+    python_path = venv_dir / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$PHASE1_PYTHON_LOG\"\n",
+        encoding="utf-8",
+    )
+    python_path.chmod(0o755)
+
+    model_path = tmp_path / "model"
+    embedding_path = tmp_path / "embedding"
+    _write_checkpoint_fixture(model_path, "config.json")
+    _write_checkpoint_fixture(embedding_path, "modules.json")
+    python_log = tmp_path / "python.log"
+
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={
+            "DRY_RUN": "0",
+            "SKIP_BOOTSTRAP": "0",
+            "PYTORCH_CUDA_VARIANT": "cu128",
+            "VENV_DIR": _bash_path(venv_dir),
+            "MODEL_PATH": _bash_path(model_path),
+            "EMBEDDING_PATH": _bash_path(embedding_path),
+            "PHASE1_PYTHON_LOG": _bash_path(python_log),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = python_log.read_text(encoding="utf-8").splitlines()
+    torch_install = next(
+        index
+        for index, invocation in enumerate(invocations)
+        if "torch==2.9.1" in invocation
+    )
+    requirements_install = next(
+        index
+        for index, invocation in enumerate(invocations)
+        if "-r requirements.txt" in invocation
+    )
+    assert torch_install < requirements_install
+    assert (
+        "--index-url https://download.pytorch.org/whl/cu128"
+        in invocations[torch_install]
+    )
+
+
+def test_launcher_runs_cuda_kivi_preflight_before_pipeline(tmp_path: Path) -> None:
+    venv_dir = tmp_path / "venv"
+    python_path = venv_dir / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$PHASE1_PYTHON_LOG\"\n"
+        "if [[ \"$*\" == *\"-m scripts.check_phase1_cuda\"* ]]; then exit 23; fi\n",
+        encoding="utf-8",
+    )
+    python_path.chmod(0o755)
+    flock_path = venv_dir / "bin" / "flock"
+    flock_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    flock_path.chmod(0o755)
+
+    model_path = tmp_path / "model"
+    embedding_path = tmp_path / "embedding"
+    _write_checkpoint_fixture(model_path, "config.json")
+    _write_checkpoint_fixture(embedding_path, "modules.json")
+    python_log = tmp_path / "python.log"
+
+    result = _run_launcher(
+        environment={
+            "DRY_RUN": "0",
+            "SKIP_BOOTSTRAP": "1",
+            "PYTORCH_CUDA_VARIANT": "cu130",
+            "VENV_DIR": _bash_path(venv_dir),
+            "MODEL_PATH": _bash_path(model_path),
+            "EMBEDDING_PATH": _bash_path(embedding_path),
+            "RUN_DIR": _bash_path(tmp_path / "run"),
+            "PHASE1_PYTHON_LOG": _bash_path(python_log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert python_log.is_file(), f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    invocations = python_log.read_text(encoding="utf-8").splitlines()
+    assert any(
+        invocation
+        == "-m scripts.check_phase1_cuda --variant cu130 --torch-version 2.9.1 --device cuda:0"
+        for invocation in invocations
+    )
+    assert not any("dataset.prepare_phase1" in invocation for invocation in invocations)

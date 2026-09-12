@@ -27,6 +27,7 @@ Environment overrides:
   HF_TOKEN=<required for gated Hugging Face model downloads>
   VENV_DIR=$PWD/.venv
   DEVICE=cuda:0
+  PYTORCH_CUDA_VARIANT=cu128  # supported: cu128, cu130
   DTYPE=float16
   SEED=42
   RUN_COLLISION_PLUS=0   # set to 1 to add frozen CPA calibration/evaluation
@@ -66,6 +67,7 @@ cd "$REPO_ROOT"
 # KIVI may be staged by the submit-side packaging step rather than initialized
 # on the compute node.  The runtime helper keeps that path Git-free.
 source "$REPO_ROOT/scripts/phase1_kivi_runtime.sh"
+source "$REPO_ROOT/scripts/phase1_cuda_runtime.sh"
 KIVI_ROOT="$REPO_ROOT/third_party/KIVI"
 KIVI_COMMIT_FILE="${KIVI_COMMIT_FILE:-$REPO_ROOT/third_party/KIVI.commit}"
 
@@ -86,6 +88,13 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
+PYTORCH_CUDA_VARIANT="${PYTORCH_CUDA_VARIANT:-cu128}"
+if ! PYTORCH_CUDA_RUNTIME="$(phase1_cuda_runtime_version "$PYTORCH_CUDA_VARIANT")"; then
+  exit 2
+fi
+if ! PYTORCH_INDEX_URL="$(phase1_torch_index_url "$PYTORCH_CUDA_VARIANT")"; then
+  exit 2
+fi
 
 if [[ -z "${PIP_INSTALL_ARGS:-}" ]]; then
   PIP_INSTALL_ARGS=()
@@ -133,19 +142,24 @@ if [[ "$SKIP_BOOTSTRAP" != "1" && "$DRY_RUN" != "1" ]]; then
     }
   fi
   export PATH="$VENV_DIR/bin:$PATH"
-  REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
-  REQUIREMENTS_STAMP="$VENV_DIR/.phase1_requirements.sha256"
-  if [[ ! -f "$REQUIREMENTS_STAMP" || "$(<"$REQUIREMENTS_STAMP")" != "$REQUIREMENTS_HASH" ]]; then
-    echo "[bootstrap] installing Python dependencies from requirements.txt"
+  DEPENDENCY_FINGERPRINT="$(phase1_dependency_fingerprint requirements.txt "$PYTORCH_CUDA_VARIANT")"
+  REQUIREMENTS_STAMP="$VENV_DIR/.phase1_dependencies.sha256"
+  if [[ ! -f "$REQUIREMENTS_STAMP" || "$(<"$REQUIREMENTS_STAMP")" != "$DEPENDENCY_FINGERPRINT" ]]; then
+    echo "[bootstrap] installing PyTorch $PHASE1_TORCH_VERSION for $PYTORCH_CUDA_VARIANT"
     python -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
+    python -m pip install --disable-pip-version-check "${PIP_INSTALL_ARGS[@]}" \
+      "torch==$PHASE1_TORCH_VERSION" --index-url "$PYTORCH_INDEX_URL"
+    echo "[bootstrap] installing Python dependencies from requirements.txt"
     python -m pip install --disable-pip-version-check "${PIP_INSTALL_ARGS[@]}" -r requirements.txt
-    printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_STAMP"
+    printf '%s\n' "$DEPENDENCY_FINGERPRINT" > "$REQUIREMENTS_STAMP"
   else
-    echo "[bootstrap] Python dependencies already match requirements.txt"
+    echo "[bootstrap] Python dependencies already match $PYTORCH_CUDA_VARIANT"
   fi
 else
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "[dry-run] would create/reuse $VENV_DIR, install requirements.txt, initialize KIVI, and download checkpoints"
+    echo "[dry-run] PyTorch: $PHASE1_TORCH_VERSION ($PYTORCH_CUDA_VARIANT / CUDA $PYTORCH_CUDA_RUNTIME)"
+    echo "[dry-run] PyTorch index: $PYTORCH_INDEX_URL"
+    echo "[dry-run] would create/reuse $VENV_DIR, install PyTorch then requirements.txt, initialize KIVI, and download checkpoints"
   fi
   if [[ -x "$VENV_DIR/bin/python" ]]; then
     export PATH="$VENV_DIR/bin:$PATH"
@@ -275,11 +289,15 @@ stage_preflight() {
   [[ -f "$MODEL_PATH/config.json" ]] || { echo "MODEL_PATH is not a Transformers checkpoint: $MODEL_PATH" >&2; return 1; }
   [[ -d "$EMBEDDING_PATH" ]] || { echo "EMBEDDING_PATH not found: $EMBEDDING_PATH" >&2; return 1; }
   [[ -f "$EMBEDDING_PATH/modules.json" || -f "$EMBEDDING_PATH/config.json" ]] || { echo "EMBEDDING_PATH is not a local Sentence Transformers checkpoint: $EMBEDDING_PATH" >&2; return 1; }
-  python -c 'import torch, transformers, datasets, sentence_transformers; print("torch", torch.__version__); print("transformers", transformers.__version__); print("cuda", torch.cuda.is_available())'
-  if [[ "$DEVICE" == cuda* ]]; then
-    python -c 'import sys, torch; sys.exit("CUDA is required for the KIVI Triton kernels, but torch.cuda.is_available() is false") if not torch.cuda.is_available() else None'
-  fi
-  python -c 'from src.kivi_adapter import KIVIConfig; print("KIVI adapter import: OK", KIVIConfig(4, 4, 32, 32))'
+  python -c 'import transformers, datasets, sentence_transformers; print("transformers", transformers.__version__)'
+  [[ "$DEVICE" == cuda* ]] || {
+    echo "Phase 1 KIVI requires DEVICE=cuda:<index>; got $DEVICE" >&2
+    return 1
+  }
+  python -m scripts.check_phase1_cuda \
+    --variant "$PYTORCH_CUDA_VARIANT" \
+    --torch-version "$PHASE1_TORCH_VERSION" \
+    --device "$DEVICE"
   {
     echo "run_id=$RUN_ID"
     echo "model_name=$MODEL_NAME"
@@ -290,6 +308,9 @@ stage_preflight() {
     echo "embedding_path=$EMBEDDING_PATH"
     echo "embedding_revision=$EMBEDDING_REVISION"
     echo "device=$DEVICE"
+    echo "pytorch_cuda_variant=$PYTORCH_CUDA_VARIANT"
+    echo "pytorch_cuda_runtime=$PYTORCH_CUDA_RUNTIME"
+    echo "pytorch_index_url=$PYTORCH_INDEX_URL"
     echo "dtype=$DTYPE"
     echo "seed=$SEED"
     echo "run_collision_plus=$RUN_COLLISION_PLUS"
