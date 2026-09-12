@@ -303,7 +303,7 @@ def test_launcher_installs_torch_before_application_requirements(
     )
 
 
-def test_launcher_runs_cuda_kivi_preflight_before_pipeline(tmp_path: Path) -> None:
+def test_launcher_reruns_cuda_kivi_preflight_when_resuming(tmp_path: Path) -> None:
     venv_dir = tmp_path / "venv"
     python_path = venv_dir / "bin" / "python"
     python_path.parent.mkdir(parents=True)
@@ -323,6 +323,12 @@ def test_launcher_runs_cuda_kivi_preflight_before_pipeline(tmp_path: Path) -> No
     _write_checkpoint_fixture(model_path, "config.json")
     _write_checkpoint_fixture(embedding_path, "modules.json")
     python_log = tmp_path / "python.log"
+    run_dir = tmp_path / "run"
+    state_dir = run_dir / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "preflight.done").write_text(
+        "2026-09-11T00:00:00Z\n", encoding="utf-8"
+    )
 
     result = _run_launcher(
         environment={
@@ -332,7 +338,8 @@ def test_launcher_runs_cuda_kivi_preflight_before_pipeline(tmp_path: Path) -> No
             "VENV_DIR": _bash_path(venv_dir),
             "MODEL_PATH": _bash_path(model_path),
             "EMBEDDING_PATH": _bash_path(embedding_path),
-            "RUN_DIR": _bash_path(tmp_path / "run"),
+            "RUN_DIR": _bash_path(run_dir),
+            "RESUME": "1",
             "PHASE1_PYTHON_LOG": _bash_path(python_log),
         },
     )

@@ -271,7 +271,7 @@ run_stage() {
     return 0
   fi
   local marker="$STATE_DIR/${stage}.done"
-  if [[ "$RESUME" == "1" && -f "$marker" ]]; then
+  if [[ "$stage" != "preflight" && "$RESUME" == "1" && -f "$marker" ]]; then
     echo "[resume] skip $stage"
     return 0
   fi

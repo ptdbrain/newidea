@@ -55,7 +55,7 @@ jobs:
     
     - name: Compile Python files
       run: |
-        python -m compileall src/ attack/ defense/ inference/ dataset/ tests/
+        python -m compileall src/ attack/ defense/ inference/ dataset/ scripts/ tests/
 
   test:
     runs-on: ubuntu-latest
