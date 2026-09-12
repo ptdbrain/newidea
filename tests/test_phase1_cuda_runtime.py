@@ -6,10 +6,39 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+from scripts.check_phase1_cuda import validate_runtime
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 CUDA_HELPER = PROJECT_ROOT / "scripts" / "phase1_cuda_runtime.sh"
+
+
+class _FakeCuda:
+    def __init__(self, available: bool) -> None:
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def get_device_name(self, _device: int = 0) -> str:
+        return "Test GPU"
+
+    def get_device_capability(self, _device: int = 0) -> tuple[int, int]:
+        return (9, 0)
+
+
+def _fake_torch(
+    torch_version: str, cuda_runtime: str | None, *, available: bool
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        __version__=torch_version,
+        version=SimpleNamespace(cuda=cuda_runtime),
+        cuda=_FakeCuda(available),
+    )
 
 
 def _bash_path(value: Path | str) -> str:
@@ -112,3 +141,54 @@ def test_dependency_fingerprint_changes_with_cuda_variant(tmp_path: Path) -> Non
     assert cu128_fingerprint.startswith("fingerprint=")
     assert cu130_fingerprint.startswith("fingerprint=")
     assert cu128_fingerprint != cu130_fingerprint
+
+
+def test_validate_runtime_accepts_matching_cu128() -> None:
+    info = validate_runtime(
+        _fake_torch("2.9.1+cu128", "12.8", available=True),
+        "cu128",
+        "2.9.1",
+    )
+
+    assert info.torch_version == "2.9.1+cu128"
+    assert info.cuda_runtime == "12.8"
+    assert info.gpu_name == "Test GPU"
+    assert info.compute_capability == (9, 0)
+
+
+def test_validate_runtime_rejects_wrong_cuda_build() -> None:
+    with pytest.raises(
+        RuntimeError, match=r"expected CUDA runtime 13\.0, got 12\.8"
+    ):
+        validate_runtime(
+            _fake_torch("2.9.1+cu128", "12.8", available=True),
+            "cu130",
+            "2.9.1",
+        )
+
+
+def test_validate_runtime_rejects_cpu_only_torch() -> None:
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        validate_runtime(
+            _fake_torch("2.9.1+cpu", None, available=False),
+            "cu128",
+            "2.9.1",
+        )
+
+
+def test_validate_runtime_rejects_wrong_torch_version() -> None:
+    with pytest.raises(RuntimeError, match=r"expected Torch 2\.9\.1, got 2\.6\.0"):
+        validate_runtime(
+            _fake_torch("2.6.0+cu126", "12.6", available=True),
+            "cu128",
+            "2.9.1",
+        )
+
+
+def test_validate_runtime_rejects_unknown_variant() -> None:
+    with pytest.raises(ValueError, match="Supported values: cu128, cu130"):
+        validate_runtime(
+            _fake_torch("2.9.1+cu128", "12.8", available=True),
+            "cu129",
+            "2.9.1",
+        )
