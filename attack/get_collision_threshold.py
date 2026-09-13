@@ -26,6 +26,197 @@ from transformers.cache_utils import DynamicCache
 from typing import Any, Dict, List, Tuple
 
 
+def _cache_key_values(cache: Any) -> Tuple[List[Tensor], List[Tensor]]:
+    """Return K/V layer lists for DynamicCache and legacy cache tuples."""
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        return list(cache.key_cache), list(cache.value_cache)
+    layers = list(cache)
+    return [layer[0] for layer in layers], [layer[1] for layer in layers]
+
+
+def _current_position_distances(
+    current_cache: Any,
+    target_datas: Any,
+    *,
+    seq_id: int,
+) -> List[Tuple[Tensor, Tensor]]:
+    """Return one scalar K/V distance per candidate and layer."""
+    current_keys, current_values = _cache_key_values(current_cache)
+    target_layers = list(target_datas)
+    if len(current_keys) != len(current_values):
+        raise ValueError(
+            f"current cache has {len(current_keys)} K layers and "
+            f"{len(current_values)} V layers"
+        )
+    if len(current_keys) != len(target_layers):
+        raise ValueError(
+            f"current cache has {len(current_keys)} layers, target has "
+            f"{len(target_layers)}"
+        )
+
+    result: List[Tuple[Tensor, Tensor]] = []
+    for layer_idx, (candidate_k, candidate_v, target_layer) in enumerate(
+        zip(current_keys, current_values, target_layers)
+    ):
+        if len(target_layer) != 2:
+            raise ValueError(f"target layer {layer_idx} must contain K and V")
+        target_k, target_v = target_layer
+        for component_name, candidate, target in (
+            ("K", candidate_k, target_k),
+            ("V", candidate_v, target_v),
+        ):
+            if candidate.ndim != 4 or target.ndim != 4:
+                raise ValueError(
+                    f"layer {layer_idx} {component_name} tensors must be rank 4"
+                )
+            if candidate.shape[2] < 1:
+                raise ValueError(
+                    f"layer {layer_idx} {component_name} candidate cache is empty"
+                )
+            if not 0 <= seq_id < target.shape[2]:
+                raise ValueError(
+                    f"sequence position {seq_id} is outside layer {layer_idx} "
+                    f"{component_name} target length {target.shape[2]}"
+                )
+            candidate_shape = (candidate.shape[1], candidate.shape[3])
+            target_shape = (target.shape[1], target.shape[3])
+            if target.shape[0] != 1 or candidate_shape != target_shape:
+                raise ValueError(
+                    f"layer {layer_idx} {component_name} shape mismatch: "
+                    f"candidate [B,{candidate_shape[0]},{candidate_shape[1]}], "
+                    f"target {tuple(target.shape)}"
+                )
+
+        candidate_k_position = candidate_k[:, :, -1, :]
+        candidate_v_position = candidate_v[:, :, -1, :]
+        target_k_position = target_k[:, :, seq_id, :]
+        target_v_position = target_v[:, :, seq_id, :]
+        k_dist = torch.linalg.vector_norm(
+            candidate_k_position - target_k_position, dim=(1, 2)
+        )
+        v_dist = torch.linalg.vector_norm(
+            candidate_v_position - target_v_position, dim=(1, 2)
+        )
+        result.append((k_dist, v_dist))
+    return result
+
+
+def _expanded_prefix_cache(current_kvcache: Any, batch_size: int) -> Any:
+    if current_kvcache is None:
+        return None
+    current_keys, current_values = _cache_key_values(current_kvcache)
+    expanded_cache = DynamicCache()
+    for layer_idx, (key, value) in enumerate(zip(current_keys, current_values)):
+        expanded_cache.update(
+            key.expand(batch_size, -1, -1, -1),
+            value.expand(batch_size, -1, -1, -1),
+            layer_idx,
+        )
+    return expanded_cache
+
+
+def collect_position_distances(
+    model: AutoModelForCausalLM,
+    target_datas: Any,
+    *,
+    current_kvcache: Any,
+    seq_id: int,
+    batch_size: int,
+) -> List[Tuple[Tensor, Tensor]]:
+    """Evaluate the complete vocabulary with bounded GPU distance memory."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    vocab_size = int(model.config.vocab_size)
+    if vocab_size <= 0:
+        raise ValueError("model vocabulary size must be positive")
+
+    if current_kvcache is None:
+        past_length = 0
+    else:
+        prefix_keys, _ = _cache_key_values(current_kvcache)
+        past_length = int(prefix_keys[0].shape[2]) if prefix_keys else 0
+    if past_length != seq_id:
+        raise ValueError(
+            f"known-prefix cache length {past_length} does not match sequence "
+            f"position {seq_id}"
+        )
+
+    num_layers = len(target_datas)
+    chunks: List[List[List[Tensor]]] = [
+        [[], []] for _ in range(num_layers)
+    ]
+    for batch_start in range(0, vocab_size, batch_size):
+        batch_end = min(batch_start + batch_size, vocab_size)
+        candidate_count = batch_end - batch_start
+        input_batch = torch.arange(
+            batch_start,
+            batch_end,
+            dtype=torch.long,
+            device=model.device,
+        ).unsqueeze(1)
+        attention_mask = torch.ones(
+            (candidate_count, past_length + 1),
+            dtype=torch.long,
+            device=model.device,
+        )
+        expanded_cache = _expanded_prefix_cache(current_kvcache, candidate_count)
+        try:
+            with torch.inference_mode():
+                outputs = model(
+                    input_ids=input_batch,
+                    attention_mask=attention_mask,
+                    past_key_values=expanded_cache,
+                    use_cache=True,
+                    output_hidden_states=False,
+                )
+            batch_distances = _current_position_distances(
+                outputs.past_key_values,
+                target_datas,
+                seq_id=seq_id,
+            )
+            for layer_idx, (k_dist, v_dist) in enumerate(batch_distances):
+                chunks[layer_idx][0].append(
+                    k_dist.detach().to(device="cpu", dtype=torch.float32)
+                )
+                chunks[layer_idx][1].append(
+                    v_dist.detach().to(device="cpu", dtype=torch.float32)
+                )
+        except torch.OutOfMemoryError as error:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise RuntimeError(
+                "CUDA OOM during Collision+ calibration at sequence position "
+                f"{seq_id}, candidates [{batch_start}:{batch_end}), batch size "
+                f"{batch_size}. Retry this checkpoint with a smaller "
+                "COLLISION_PLUS_BATCH_SIZE."
+            ) from error
+        finally:
+            if "outputs" in locals():
+                del outputs
+            del expanded_cache, attention_mask, input_batch
+
+    result: List[Tuple[Tensor, Tensor]] = []
+    for layer_idx, (k_chunks, v_chunks) in enumerate(chunks):
+        if not k_chunks or not v_chunks:
+            raise RuntimeError(f"layer {layer_idx} produced no distance chunks")
+        k_distances = torch.cat(k_chunks)
+        v_distances = torch.cat(v_chunks)
+        if k_distances.numel() != vocab_size or v_distances.numel() != vocab_size:
+            raise RuntimeError(
+                f"layer {layer_idx} produced incomplete vocabulary distances: "
+                f"K={k_distances.numel()}, V={v_distances.numel()}, "
+                f"expected={vocab_size}"
+            )
+        if not bool(torch.isfinite(k_distances).all()) or not bool(
+            torch.isfinite(v_distances).all()
+        ):
+            raise FloatingPointError(
+                f"layer {layer_idx} produced non-finite candidate distances"
+            )
+        result.append((k_distances, v_distances))
+    return result
+
+
 def get_bos_token_ids(config: AutoConfig) -> List[int]:
     """Extract BOS token IDs from config."""
     bos_token_id = getattr(config, "bos_token_id", None)
