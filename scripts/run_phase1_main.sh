@@ -456,7 +456,7 @@ stage_collision_plus() {
   if [[ "$RUN_COLLISION_PLUS" == "1" ]]; then
     local calibration_dataset="$RUN_DIR/collision_plus_calibration.jsonl"
     if [[ "$DRY_RUN" != "1" ]]; then
-      python -c 'import json,sys; from src.config import BITTER_LESSON_TEXT; json.dump({"prompt": BITTER_LESSON_TEXT}, open(sys.argv[1], "w", encoding="utf-8")); open(sys.argv[1], "a", encoding="utf-8").write("\\n")' "$calibration_dataset"
+      python -c 'import json,sys; from src.config import BITTER_LESSON_TEXT; json.dump({"prompt": BITTER_LESSON_TEXT}, open(sys.argv[1], "w", encoding="utf-8")); open(sys.argv[1], "a", encoding="utf-8").write("\n")' "$calibration_dataset"
     fi
     python inference/get_kvcache.py \
       --model-name "$MODEL_NAME" --model-path "$MODEL_PATH" \
