@@ -242,6 +242,46 @@ def test_launcher_dry_run_supports_cu130() -> None:
     )
 
 
+def test_launcher_dry_run_defaults_collision_plus_batch_size() -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={
+            "DRY_RUN": "1",
+            "COLLISION_PLUS_BATCH_SIZE": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Collision+ candidate batch size: 128" in result.stdout
+
+
+def test_launcher_dry_run_accepts_collision_plus_batch_override() -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={
+            "DRY_RUN": "1",
+            "COLLISION_PLUS_BATCH_SIZE": "64",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Collision+ candidate batch size: 64" in result.stdout
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_launcher_rejects_invalid_collision_plus_batch_size(value: str) -> None:
+    result = _run_launcher(
+        "--bootstrap-only",
+        environment={
+            "DRY_RUN": "1",
+            "COLLISION_PLUS_BATCH_SIZE": value,
+        },
+    )
+
+    assert result.returncode == 2
+    assert "COLLISION_PLUS_BATCH_SIZE must be a positive integer" in result.stderr
+
+
 def test_launcher_rejects_unsupported_cuda_variant() -> None:
     result = _run_launcher(
         "--bootstrap-only",

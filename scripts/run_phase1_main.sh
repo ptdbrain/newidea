@@ -31,6 +31,7 @@ Environment overrides:
   DTYPE=float16
   SEED=42
   RUN_COLLISION_PLUS=0   # set to 1 to add frozen CPA calibration/evaluation
+  COLLISION_PLUS_BATCH_SIZE=128
   MAX_NEW_TOKENS=16
   RESUME=0
   RUN_DIR=<auto-created timestamped directory>
@@ -84,6 +85,7 @@ DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-float16}"
 SEED="${SEED:-42}"
 RUN_COLLISION_PLUS="${RUN_COLLISION_PLUS:-0}"
+COLLISION_PLUS_BATCH_SIZE="${COLLISION_PLUS_BATCH_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -95,6 +97,10 @@ fi
 if ! PYTORCH_INDEX_URL="$(phase1_torch_index_url "$PYTORCH_CUDA_VARIANT")"; then
   exit 2
 fi
+[[ "$COLLISION_PLUS_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+  echo "COLLISION_PLUS_BATCH_SIZE must be a positive integer; got $COLLISION_PLUS_BATCH_SIZE" >&2
+  exit 2
+}
 
 if [[ -z "${PIP_INSTALL_ARGS:-}" ]]; then
   PIP_INSTALL_ARGS=()
@@ -159,6 +165,7 @@ else
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "[dry-run] PyTorch: $PHASE1_TORCH_VERSION ($PYTORCH_CUDA_VARIANT / CUDA $PYTORCH_CUDA_RUNTIME)"
     echo "[dry-run] PyTorch index: $PYTORCH_INDEX_URL"
+    echo "[dry-run] Collision+ candidate batch size: $COLLISION_PLUS_BATCH_SIZE"
     echo "[dry-run] would create/reuse $VENV_DIR, install PyTorch then requirements.txt, initialize KIVI, and download checkpoints"
   fi
   if [[ -x "$VENV_DIR/bin/python" ]]; then
@@ -314,6 +321,7 @@ stage_preflight() {
     echo "dtype=$DTYPE"
     echo "seed=$SEED"
     echo "run_collision_plus=$RUN_COLLISION_PLUS"
+    echo "collision_plus_batch_size=$COLLISION_PLUS_BATCH_SIZE"
     echo "dataset_path=$DATASET_PATH"
     echo "cache_root=$CACHE_ROOT"
     python --version
@@ -485,7 +493,8 @@ stage_collision_plus() {
         --model_path "$MODEL_PATH" --target_data_path "$target" \
         --input_text "$(python -c 'from src.config import BITTER_LESSON_TEXT; print(BITTER_LESSON_TEXT)')" \
         --protect_type "$protect" --target_model_name "$MODEL_NAME" \
-        --dtype "$DTYPE" --device "$DEVICE" --batch_size 512
+        --dtype "$DTYPE" --device "$DEVICE" \
+        --batch_size "$COLLISION_PLUS_BATCH_SIZE"
       local output="$RAW_DIR/${label}_collision_plus.jsonl"
       if [[ "$DRY_RUN" != "1" && -f "$output" ]]; then
         mv "$output" "$output.partial.$(date -u +%Y%m%dT%H%M%SZ)"

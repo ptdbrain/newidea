@@ -22,7 +22,8 @@ Sau khi checkout repo, trên máy Linux có GPU CUDA chạy:
 ```bash
 cd /workspace/newidea
 export HF_TOKEN=hf_...  # Llama-3.2-1B yêu cầu quyền truy cập Hugging Face
-PYTORCH_CUDA_VARIANT=cu128 RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
+PYTORCH_CUDA_VARIANT=cu128 COLLISION_PLUS_BATCH_SIZE=128 \
+RUN_COLLISION_PLUS=1 bash scripts/run_phase_1
 ```
 
 `cu128` là mặc định. Nếu node chạy CUDA 13.0, dùng:
@@ -55,6 +56,10 @@ khác, phải thay cả `SOURCE_DATASET` và `SOURCE_REVISION`,
 
 `RUN_COLLISION_PLUS=1` làm thêm calibration CPA cho từng condition; đây là
 bước tốn thời gian nhất. Nếu chỉ cần main Protocol-A screening, bỏ biến này:
+
+Collision+ duyệt chính xác toàn bộ vocabulary theo batch 128 và chỉ giữ batch
+hiện tại trên GPU. Có thể giảm `COLLISION_PLUS_BATCH_SIZE` nếu GPU nhỏ hơn;
+thay đổi batch không làm mất checkpoint calibration đã hoàn thành.
 
 ```bash
 cd /workspace/newidea && bash scripts/run_phase_1
@@ -145,8 +150,15 @@ Nếu job bị ngắt, chạy lại cùng `RUN_DIR`; các stage đã có marker 
 qua:
 
 ```bash
-RESUME=1 RUN_DIR=/workspace/newidea/logs/phase1_main_<timestamp> bash scripts/run_phase1_main.sh
+COLLISION_PLUS_BATCH_SIZE=128 RESUME=1 \
+RUN_DIR=/workspace/newidea/logs/phase1_main_<timestamp> \
+bash scripts/run_phase1_main.sh
 ```
+
+Trong stage Collision+, mỗi condition lưu tiến độ sau từng vị trí token tại
+`<target-cache>/past_key_values_dist/streaming_stats_v2.pt`. Khi resume, các
+position đã checkpoint không bị tính lại. Các file legacy `seq=*.pt` từ code
+cũ bị bỏ qua nhưng không bị xóa.
 
 Launcher giữ lại output dở dang bằng hậu tố `.partial.<timestamp>`, không xóa
 cache hay raw result cũ. Kiểm tra nhanh:

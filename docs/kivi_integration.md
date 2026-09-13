@@ -110,8 +110,15 @@ python attack/get_collision_threshold.py \
   --target_data_path cache/float16/lmsys-chat-1m_1k/Llama-3.2-1B/<hash>/kivi_k2_v2_g32_r32/past_key_values.pt \
   --protect_type kivi_k2_v2_g32_r32 \
   --target_model_name Llama-3.2-1B \
-  --dtype float16 --device cuda:0
+  --dtype float16 --device cuda:0 --batch_size 128
 ```
+
+Calibration evaluates the complete vocabulary exactly. It compares only the
+new candidate position, transfers scalar K/V distances to CPU, and checkpoints
+after every calibration token at
+`<target-cache>/past_key_values_dist/streaming_stats_v2.pt`. Rerunning the same
+command resumes a matching checkpoint. Batch size may change between retries;
+legacy `seq=*.pt` files are ignored and preserved.
 
 ## Utility evaluation
 
