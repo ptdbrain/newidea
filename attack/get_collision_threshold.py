@@ -25,6 +25,27 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.cache_utils import DynamicCache
 from typing import Any, Dict, List, Tuple
 
+try:
+    from .collision_threshold_stats import (
+        finalize_statistics,
+        load_checkpoint,
+        new_layer_statistics,
+        save_checkpoint,
+        stable_cache_digest,
+        update_position_statistics,
+        write_json_atomic,
+    )
+except ImportError:  # Support direct `python attack/get_collision_threshold.py`.
+    from collision_threshold_stats import (
+        finalize_statistics,
+        load_checkpoint,
+        new_layer_statistics,
+        save_checkpoint,
+        stable_cache_digest,
+        update_position_statistics,
+        write_json_atomic,
+    )
+
 
 def _cache_key_values(cache: Any) -> Tuple[List[Tensor], List[Tensor]]:
     """Return K/V layer lists for DynamicCache and legacy cache tuples."""
@@ -215,6 +236,146 @@ def collect_position_distances(
             )
         result.append((k_distances, v_distances))
     return result
+
+
+def rebuild_prefix_cache(
+    model: AutoModelForCausalLM,
+    input_ids: Tensor,
+    *,
+    next_seq_id: int,
+) -> Any:
+    """Rebuild the true-token prefix represented by a streaming checkpoint."""
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("calibration input_ids must have shape [1, sequence_length]")
+    if not 0 <= next_seq_id <= input_ids.shape[1]:
+        raise ValueError(
+            f"next_seq_id {next_seq_id} is outside sequence length {input_ids.shape[1]}"
+        )
+    if next_seq_id == 0:
+        return None
+    prefix_ids = input_ids[:, :next_seq_id]
+    attention_mask = torch.ones_like(prefix_ids, device=model.device)
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=prefix_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+    return outputs.past_key_values
+
+
+def _append_true_token(
+    model: AutoModelForCausalLM,
+    input_ids: Tensor,
+    *,
+    seq_id: int,
+    current_kvcache: Any,
+) -> Any:
+    token = input_ids[:, seq_id : seq_id + 1]
+    attention_mask = torch.ones(
+        (1, seq_id + 1), dtype=torch.long, device=model.device
+    )
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=token,
+            attention_mask=attention_mask,
+            past_key_values=current_kvcache,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+    return outputs.past_key_values
+
+
+def calibrate_streaming(
+    model: AutoModelForCausalLM,
+    target_datas: Any,
+    *,
+    input_ids: Tensor,
+    batch_size: int,
+    checkpoint_path: Path,
+    metadata: Dict[str, Any],
+) -> List[Dict[str, List[float]]]:
+    """Calibrate exact full-vocabulary thresholds with resumable CPU stats."""
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("calibration input_ids must have shape [1, sequence_length]")
+    sequence_length = int(input_ids.shape[1])
+    vocab_size = int(model.config.vocab_size)
+    num_layers = len(target_datas)
+
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_file():
+        next_seq_id, layer_statistics = load_checkpoint(
+            checkpoint_path,
+            expected_metadata=metadata,
+        )
+        print(
+            f"Resuming Collision+ calibration at sequence position "
+            f"{next_seq_id}/{sequence_length}"
+        )
+    else:
+        next_seq_id = 0
+        layer_statistics = new_layer_statistics(num_layers)
+
+    if len(layer_statistics) != num_layers:
+        raise ValueError(
+            f"checkpoint has {len(layer_statistics)} layers, target has {num_layers}"
+        )
+    if not 0 <= next_seq_id <= sequence_length:
+        raise ValueError(
+            f"checkpoint next_seq_id {next_seq_id} is outside sequence length "
+            f"{sequence_length}"
+        )
+    if next_seq_id == sequence_length:
+        return finalize_statistics(
+            layer_statistics,
+            sequence_length=sequence_length,
+            vocab_size=vocab_size,
+        )
+
+    current_kvcache = rebuild_prefix_cache(
+        model,
+        input_ids,
+        next_seq_id=next_seq_id,
+    )
+    for seq_id in tqdm(
+        range(next_seq_id, sequence_length),
+        desc="Calculating exact Collision+ distances",
+        initial=next_seq_id,
+        total=sequence_length,
+    ):
+        position_distances = collect_position_distances(
+            model,
+            target_datas,
+            current_kvcache=current_kvcache,
+            seq_id=seq_id,
+            batch_size=batch_size,
+        )
+        true_token_id = int(input_ids[0, seq_id].item())
+        update_position_statistics(
+            layer_statistics,
+            position_distances,
+            true_token_id=true_token_id,
+        )
+        save_checkpoint(
+            checkpoint_path,
+            next_seq_id=seq_id + 1,
+            layer_statistics=layer_statistics,
+            metadata=metadata,
+            batch_size=batch_size,
+        )
+        current_kvcache = _append_true_token(
+            model,
+            input_ids,
+            seq_id=seq_id,
+            current_kvcache=current_kvcache,
+        )
+
+    return finalize_statistics(
+        layer_statistics,
+        sequence_length=sequence_length,
+        vocab_size=vocab_size,
+    )
 
 
 def get_bos_token_ids(config: AutoConfig) -> List[int]:
@@ -509,6 +670,11 @@ def main():
     print(f"Dtype: {dtype_name}")
     print()
 
+    if args.target != "past_key_values":
+        raise ValueError(
+            "exact streaming calibration currently supports target=past_key_values only"
+        )
+
     # Load model and data
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -518,13 +684,19 @@ def main():
     model.eval()
 
     print("Loading target data...")
-    target_datas = torch.load(target_data_path, weights_only=True)
-
-    if args.target == "past_key_values":
-        target_datas = tuple(
-            (k.to(device=device, dtype=dtype), v.to(device=device, dtype=dtype))
-            for (k, v) in target_datas
+    target_datas_cpu = torch.load(
+        target_data_path, map_location="cpu", weights_only=True
+    )
+    target_digest = stable_cache_digest(target_datas_cpu)
+    target_keys, target_values = _cache_key_values(target_datas_cpu)
+    target_datas = tuple(
+        (
+            key.to(device=device, dtype=dtype),
+            value.to(device=device, dtype=dtype),
         )
+        for key, value in zip(target_keys, target_values)
+    )
+    del target_datas_cpu
 
     # Prepare inputs
     inputs = tokenizer(args.input_text, return_tensors="pt").to(device)
@@ -543,65 +715,78 @@ def main():
                 [torch.ones(1, bos_len).to(device), inputs["attention_mask"]], dim=1
             )
 
-    # Step 1: Generate distance statistics
+    input_ids = inputs["input_ids"]
+    sequence_length = int(input_ids.shape[1])
+    if len(target_datas) != int(model.config.num_hidden_layers):
+        raise ValueError(
+            f"target cache has {len(target_datas)} layers, model has "
+            f"{model.config.num_hidden_layers}"
+        )
+    for layer_idx, (key, value) in enumerate(target_datas):
+        if key.ndim != 4 or value.ndim != 4 or key.shape != value.shape:
+            raise ValueError(
+                f"target layer {layer_idx} must contain equal rank-4 K/V tensors"
+            )
+        if key.shape[0] != 1 or key.shape[2] != sequence_length:
+            raise ValueError(
+                f"target layer {layer_idx} shape {tuple(key.shape)} does not match "
+                f"calibration sequence length {sequence_length}"
+            )
+
+    # Step 1: Generate exact streaming distance statistics
     print("\n" + "=" * 60)
-    print("Step 1: Generating distance statistics...")
+    print("Step 1: Generating exact streaming distance statistics...")
     print("=" * 60)
     target_dist_dir = target_data_path.parent / f"{args.target}_dist"
+    target_dist_dir.mkdir(parents=True, exist_ok=True)
+    legacy_files = sorted(target_dist_dir.glob("seq=*.pt"))
+    if legacy_files:
+        print(
+            f"Warning: ignoring {len(legacy_files)} legacy distance files in "
+            f"{target_dist_dir}"
+        )
+    checkpoint_path = target_dist_dir / "streaming_stats_v2.pt"
+    metadata = {
+        "target_digest": target_digest,
+        "input_hash": input_hash,
+        "model_path": str(model_path.resolve()),
+        "model_name": model_path.name,
+        "target_model_name": target_model_name,
+        "vocab_size": int(model.config.vocab_size),
+        "num_layers": len(target_datas),
+        "sequence_length": sequence_length,
+        "dtype": dtype_name,
+        "target": args.target,
+    }
     start_time = time.time()
-
-    statistic_distance(
-        model, target_datas, args.target, inputs, args.batch_size, target_dist_dir
+    statistics = calibrate_streaming(
+        model,
+        target_datas,
+        input_ids=input_ids,
+        batch_size=args.batch_size,
+        checkpoint_path=checkpoint_path,
+        metadata=metadata,
     )
-
-    print(f"\nStatistics saved to: {target_dist_dir}")
+    print(f"\nStreaming checkpoint: {checkpoint_path}")
     print(f"Time: {time.time() - start_time:.2f}s")
 
-    # Step 2: Analyze distances
-    print("\n" + "=" * 60)
-    print("Step 2: Analyzing distances...")
-    print("=" * 60)
-
-    target_dists = load_target_dists(target_dist_dir)
-    dists = analyze_distances(model_path, target_dists, args.target, args.input_text)
-
-    # Compile statistics
-    statistics = [
-        {
-            "L0_model_name": model_path.name,
-            "L1_model_name": target_model_name,
-            "input_hash": input_hash,
-            "seq_len": len(dists[0][0]),
-            "target": args.target,
-            "layer_idx": layer_idx,
-            "target_mean": [
-                target_dists[i].mean().item() for i in range(len(target_dists))
-            ],
-            "target_std": [
-                target_dists[i].std().item() for i in range(len(target_dists))
-            ],
-            "target_max": [
-                target_dists[i].max().item() for i in range(len(target_dists))
-            ],
-            "others_mean": [
-                others_dists[i].mean().item() for i in range(len(target_dists))
-            ],
-            "others_std": [
-                others_dists[i].std().item() for i in range(len(target_dists))
-            ],
-            "others_min": [
-                others_dists[i].min().item() for i in range(len(target_dists))
-            ],
-        }
-        for layer_idx, (target_dists, others_dists) in enumerate(dists)
-    ]
+    for layer_idx, layer_statistics in enumerate(statistics):
+        layer_statistics.update(
+            {
+                "L0_model_name": model_path.name,
+                "L1_model_name": target_model_name,
+                "input_hash": input_hash,
+                "seq_len": sequence_length,
+                "target": args.target,
+                "layer_idx": layer_idx,
+            }
+        )
 
     # Save configuration
     output_path = Path(
         f"attack/config/{args.protect_type}/{dtype_name}/{target_model_name}.json"
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(statistics, indent=4))
+    write_json_atomic(output_path, statistics)
 
     print(f"\nCollision+ configuration saved to: {output_path}")
     print("\nYou can now run collision+ attack with: --enhance")

@@ -11,12 +11,19 @@ import torch
 from attack.collision_threshold_stats import (
     RunningStats,
     finalize_statistics,
+    load_checkpoint,
     new_layer_statistics,
+    save_checkpoint,
+    stable_cache_digest,
     update_position_statistics,
+    write_json_atomic,
 )
 from attack.get_collision_threshold import (
+    _cache_key_values,
     _current_position_distances,
+    calibrate_streaming,
     collect_position_distances,
+    rebuild_prefix_cache,
 )
 
 
@@ -40,9 +47,9 @@ class FakeCandidateModel:
         *,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        past_key_values: FakeCache | None,
         use_cache: bool,
         output_hidden_states: bool,
+        past_key_values: FakeCache | None = None,
     ) -> SimpleNamespace:
         assert use_cache is True
         assert output_hidden_states is False
@@ -50,9 +57,10 @@ class FakeCandidateModel:
         candidates = input_ids[:, 0].to(dtype=torch.float32)
         self.candidate_ids.extend(int(item) for item in candidates.tolist())
         batch_size = candidates.shape[0]
-        prefix_length = (
-            0 if past_key_values is None else past_key_values.key_cache[0].shape[2]
-        )
+        prefix_length = 0
+        if past_key_values is not None:
+            prefix_keys, _ = _cache_key_values(past_key_values)
+            prefix_length = prefix_keys[0].shape[2]
         old_prefix = torch.full((batch_size, 1, prefix_length, 1), 999.0)
         key = torch.cat(
             (old_prefix, candidates.reshape(batch_size, 1, 1, 1)), dim=2
@@ -291,3 +299,225 @@ def test_full_vocabulary_collection_rejects_non_positive_batch() -> None:
             seq_id=0,
             batch_size=0,
         )
+
+
+def test_stable_cache_digest_tracks_tensor_content_shape_and_dtype() -> None:
+    original = ((torch.tensor([[[[1.0, 2.0]]]]), torch.tensor([[[[3.0, 4.0]]]])),)
+    equivalent = tuple((key.clone(), value.clone()) for key, value in original)
+    changed_value = ((original[0][0].clone(), torch.tensor([[[[3.0, 5.0]]]])),)
+    changed_shape = (
+        (original[0][0].reshape(1, 1, 2, 1), original[0][1].reshape(1, 1, 2, 1)),
+    )
+    changed_dtype = tuple(
+        (key.double(), value.double()) for key, value in original
+    )
+
+    digest = stable_cache_digest(original)
+
+    assert stable_cache_digest(equivalent) == digest
+    assert stable_cache_digest(changed_value) != digest
+    assert stable_cache_digest(changed_shape) != digest
+    assert stable_cache_digest(changed_dtype) != digest
+
+
+def test_checkpoint_roundtrip_preserves_stats_and_records_batch(
+    tmp_path,
+) -> None:
+    state = new_layer_statistics(1)
+    update_position_statistics(
+        state,
+        [(torch.tensor([0.0, 1.0, 2.0]), torch.tensor([3.0, 4.0, 5.0]))],
+        true_token_id=2,
+    )
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    metadata = {"target_digest": "abc", "vocab_size": 3, "num_layers": 1}
+
+    save_checkpoint(
+        checkpoint_path,
+        next_seq_id=1,
+        layer_statistics=state,
+        metadata=metadata,
+        batch_size=128,
+    )
+    next_seq_id, restored = load_checkpoint(
+        checkpoint_path,
+        expected_metadata=metadata,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+
+    assert next_seq_id == 1
+    assert restored[0]["target"][0].count == 1
+    assert restored[0]["target"][0].mean == 2.0
+    assert restored[0]["others"][1].mean == pytest.approx(3.5)
+    assert payload["execution"]["batch_size"] == 128
+    assert not checkpoint_path.with_suffix(".pt.tmp").exists()
+
+
+def test_checkpoint_allows_batch_change_but_rejects_semantic_mismatch(
+    tmp_path,
+) -> None:
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    metadata = {"target_digest": "abc", "vocab_size": 3, "num_layers": 1}
+    save_checkpoint(
+        checkpoint_path,
+        next_seq_id=0,
+        layer_statistics=new_layer_statistics(1),
+        metadata=metadata,
+        batch_size=128,
+    )
+
+    next_seq_id, _ = load_checkpoint(
+        checkpoint_path,
+        expected_metadata=metadata,
+    )
+    assert next_seq_id == 0
+
+    with pytest.raises(
+        ValueError,
+        match="checkpoint metadata mismatch for target_digest: expected def, got abc",
+    ):
+        load_checkpoint(
+            checkpoint_path,
+            expected_metadata={**metadata, "target_digest": "def"},
+        )
+
+
+def test_checkpoint_rejects_truncated_payload(tmp_path) -> None:
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    checkpoint_path.write_bytes(b"not a torch checkpoint")
+
+    with pytest.raises(RuntimeError, match=r"could not load Collision\+ checkpoint"):
+        load_checkpoint(
+            checkpoint_path,
+            expected_metadata={"target_digest": "abc"},
+        )
+
+
+def test_atomic_json_writer_replaces_complete_document(tmp_path) -> None:
+    output_path = tmp_path / "config.json"
+    output_path.write_text("old", encoding="utf-8")
+
+    write_json_atomic(output_path, [{"target_mean": [1.0, 2.0]}])
+
+    assert output_path.read_text(encoding="utf-8").endswith("\n")
+    assert output_path.read_text(encoding="utf-8").startswith("[\n")
+    assert not output_path.with_suffix(".json.tmp").exists()
+
+
+class NoCallModel:
+    device = torch.device("cpu")
+    config = SimpleNamespace(vocab_size=3)
+
+    def __call__(self, **_kwargs):
+        raise AssertionError("completed checkpoint must not call the model")
+
+
+def test_completed_checkpoint_finalizes_without_model_calls(tmp_path) -> None:
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    metadata = {"target_digest": "abc", "vocab_size": 3, "num_layers": 1}
+    state = new_layer_statistics(1)
+    update_position_statistics(
+        state,
+        [(torch.tensor([0.0, 1.0, 2.0]), torch.tensor([3.0, 4.0, 5.0]))],
+        true_token_id=2,
+    )
+    save_checkpoint(
+        checkpoint_path,
+        next_seq_id=1,
+        layer_statistics=state,
+        metadata=metadata,
+        batch_size=128,
+    )
+
+    config = calibrate_streaming(
+        NoCallModel(),
+        ((torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)),),
+        input_ids=torch.tensor([[2]]),
+        batch_size=64,
+        checkpoint_path=checkpoint_path,
+        metadata=metadata,
+    )
+
+    assert config[0]["target_mean"] == pytest.approx([2.0, 5.0])
+    assert config[0]["others_mean"] == pytest.approx([0.5, 3.5])
+
+
+class PrefixModel:
+    device = torch.device("cpu")
+
+    def __init__(self) -> None:
+        self.seen_input_ids: list[list[int]] = []
+
+    def __call__(self, *, input_ids, attention_mask, use_cache, output_hidden_states):
+        assert use_cache is True
+        assert output_hidden_states is False
+        assert attention_mask.shape == input_ids.shape
+        self.seen_input_ids.append(input_ids[0].tolist())
+        length = input_ids.shape[1]
+        cache = FakeCache(
+            [torch.zeros(1, 1, length, 1)],
+            [torch.zeros(1, 1, length, 1)],
+        )
+        return SimpleNamespace(past_key_values=cache)
+
+
+def test_rebuild_prefix_cache_uses_only_completed_positions() -> None:
+    model = PrefixModel()
+
+    cache = rebuild_prefix_cache(
+        model,
+        torch.tensor([[10, 20, 30, 40]]),
+        next_seq_id=2,
+    )
+
+    assert model.seen_input_ids == [[10, 20]]
+    assert cache.key_cache[0].shape[2] == 2
+
+
+def test_partial_checkpoint_resumes_at_next_position(tmp_path) -> None:
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    metadata = {"target_digest": "abc", "vocab_size": 5, "num_layers": 1}
+    state = new_layer_statistics(1)
+    update_position_statistics(
+        state,
+        [
+            (
+                torch.tensor([2.0, 1.0, 0.0, 1.0, 2.0]),
+                torch.tensor([4.0, 2.0, 0.0, 2.0, 4.0]),
+            )
+        ],
+        true_token_id=2,
+    )
+    save_checkpoint(
+        checkpoint_path,
+        next_seq_id=1,
+        layer_statistics=state,
+        metadata=metadata,
+        batch_size=128,
+    )
+    model = FakeCandidateModel()
+    target = (
+        (
+            torch.tensor([[[[2.0], [3.0]]]]),
+            torch.tensor([[[[4.0], [6.0]]]]),
+        ),
+    )
+
+    config = calibrate_streaming(
+        model,
+        target,
+        input_ids=torch.tensor([[2, 3]]),
+        batch_size=2,
+        checkpoint_path=checkpoint_path,
+        metadata=metadata,
+    )
+
+    assert model.candidate_ids == [2, 0, 1, 2, 3, 4, 3]
+    assert config[0]["target_mean"] == pytest.approx([0.0, 0.0])
+    assert config[0]["target_max"] == pytest.approx([0.0, 0.0])
+    next_seq_id, restored = load_checkpoint(
+        checkpoint_path,
+        expected_metadata=metadata,
+    )
+    assert next_seq_id == 2
+    assert restored[0]["target"][0].count == 2
