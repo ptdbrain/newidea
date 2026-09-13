@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
-
 
 COMPONENT_NAMES = ("K", "V")
 CHECKPOINT_FORMAT = "collision-plus-streaming-v2"
@@ -81,7 +81,7 @@ class RunningStats:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "RunningStats":
+    def from_dict(cls, payload: Mapping[str, Any]) -> RunningStats:
         result = cls(
             count=int(payload["count"]),
             mean_value=float(payload["mean_value"]),
@@ -219,6 +219,36 @@ def finalize_statistics(
     return result
 
 
+def validate_progress_counts(
+    layer_statistics: Sequence[LayerStatistics],
+    *,
+    completed_positions: int,
+    vocab_size: int,
+) -> None:
+    """Reject checkpoints whose aggregate counts disagree with resume progress."""
+    if completed_positions < 0:
+        raise ValueError("completed_positions must be non-negative")
+    if vocab_size <= 1:
+        raise ValueError("vocab_size must be greater than one")
+
+    expected_target_count = completed_positions
+    expected_others_count = completed_positions * (vocab_size - 1)
+    for layer_index, state in enumerate(layer_statistics):
+        for component_index, component_name in enumerate(COMPONENT_NAMES):
+            target = state["target"][component_index]
+            others = state["others"][component_index]
+            if target.count != expected_target_count:
+                raise ValueError(
+                    f"layer {layer_index} {component_name} target count: expected "
+                    f"{expected_target_count}, got {target.count}"
+                )
+            if others.count != expected_others_count:
+                raise ValueError(
+                    f"layer {layer_index} {component_name} others count: expected "
+                    f"{expected_others_count}, got {others.count}"
+                )
+
+
 def _legacy_layers(cache: Any) -> list[tuple[Tensor, Tensor]]:
     if hasattr(cache, "to_legacy_cache"):
         cache = cache.to_legacy_cache()
@@ -273,7 +303,7 @@ def _deserialize_layer_statistics(payload: Any) -> list[LayerStatistics]:
     result: list[LayerStatistics] = []
     for layer_index, layer in enumerate(payload):
         if not isinstance(layer, Mapping):
-            raise ValueError(f"checkpoint layer {layer_index} is malformed")
+            raise TypeError(f"checkpoint layer {layer_index} is malformed")
         restored: LayerStatistics = {}
         for population in ("target", "others"):
             components = layer.get(population)
@@ -332,7 +362,7 @@ def load_checkpoint(
         )
     actual_metadata = payload.get("metadata")
     if not isinstance(actual_metadata, Mapping):
-        raise ValueError("Collision+ checkpoint metadata is malformed")
+        raise TypeError("Collision+ checkpoint metadata is malformed")
     for field in sorted(set(expected_metadata) | set(actual_metadata)):
         expected = expected_metadata.get(field)
         actual = actual_metadata.get(field)

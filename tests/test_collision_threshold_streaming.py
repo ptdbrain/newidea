@@ -21,6 +21,7 @@ from attack.collision_threshold_stats import (
 from attack.get_collision_threshold import (
     _cache_key_values,
     _current_position_distances,
+    build_parser,
     calibrate_streaming,
     collect_position_distances,
     rebuild_prefix_cache,
@@ -448,12 +449,24 @@ class PrefixModel:
     def __init__(self) -> None:
         self.seen_input_ids: list[list[int]] = []
 
-    def __call__(self, *, input_ids, attention_mask, use_cache, output_hidden_states):
+    def __call__(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        use_cache,
+        output_hidden_states,
+        past_key_values=None,
+    ):
         assert use_cache is True
         assert output_hidden_states is False
-        assert attention_mask.shape == input_ids.shape
+        previous_length = 0
+        if past_key_values is not None:
+            previous_keys, _ = _cache_key_values(past_key_values)
+            previous_length = int(previous_keys[0].shape[2])
+        assert attention_mask.shape == (1, previous_length + input_ids.shape[1])
         self.seen_input_ids.append(input_ids[0].tolist())
-        length = input_ids.shape[1]
+        length = previous_length + input_ids.shape[1]
         cache = FakeCache(
             [torch.zeros(1, 1, length, 1)],
             [torch.zeros(1, 1, length, 1)],
@@ -470,8 +483,41 @@ def test_rebuild_prefix_cache_uses_only_completed_positions() -> None:
         next_seq_id=2,
     )
 
-    assert model.seen_input_ids == [[10, 20]]
+    assert model.seen_input_ids == [[10], [20]]
     assert cache.key_cache[0].shape[2] == 2
+
+
+def test_cli_defaults_to_bounded_candidate_batch() -> None:
+    args = build_parser().parse_args(["--target_data_path", "cache.pt"])
+
+    assert args.batch_size == 128
+
+
+def test_checkpoint_rejects_progress_count_mismatch_before_model_call(
+    tmp_path,
+) -> None:
+    checkpoint_path = tmp_path / "streaming_stats_v2.pt"
+    metadata = {"target_digest": "abc", "vocab_size": 3, "num_layers": 1}
+    save_checkpoint(
+        checkpoint_path,
+        next_seq_id=1,
+        layer_statistics=new_layer_statistics(1),
+        metadata=metadata,
+        batch_size=128,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="layer 0 K target count: expected 1, got 0",
+    ):
+        calibrate_streaming(
+            NoCallModel(),
+            ((torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)),),
+            input_ids=torch.tensor([[2]]),
+            batch_size=64,
+            checkpoint_path=checkpoint_path,
+            metadata=metadata,
+        )
 
 
 def test_partial_checkpoint_resumes_at_next_position(tmp_path) -> None:
@@ -511,8 +557,17 @@ def test_partial_checkpoint_resumes_at_next_position(tmp_path) -> None:
         checkpoint_path=checkpoint_path,
         metadata=metadata,
     )
+    uninterrupted = calibrate_streaming(
+        FakeCandidateModel(),
+        target,
+        input_ids=torch.tensor([[2, 3]]),
+        batch_size=3,
+        checkpoint_path=tmp_path / "uninterrupted.pt",
+        metadata=metadata,
+    )
 
     assert model.candidate_ids == [2, 0, 1, 2, 3, 4, 3]
+    assert config == uninterrupted
     assert config[0]["target_mean"] == pytest.approx([0.0, 0.0])
     assert config[0]["target_max"] == pytest.approx([0.0, 0.0])
     next_seq_id, restored = load_checkpoint(
