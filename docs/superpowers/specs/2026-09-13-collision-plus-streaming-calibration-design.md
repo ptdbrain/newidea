@@ -118,10 +118,13 @@ The checkpoint contains only CPU values:
 Writes use a temporary sibling followed by `os.replace`, so interruption
 cannot expose a partially written checkpoint.
 
-On resume, metadata must match the current invocation exactly. A mismatch
-fails with a message naming the differing field; it is never silently reused.
-Legacy `seq=*.pt` files from the broken implementation are ignored. They are
-not deleted automatically.
+On resume, semantic metadata must match the current invocation exactly. A
+mismatch fails with a message naming the differing field; it is never silently
+reused. Candidate batch size is execution granularity rather than semantic
+identity, so it is recorded for provenance but may be reduced or increased
+when resuming without invalidating completed positions. Legacy `seq=*.pt`
+files from the broken implementation are ignored. They are not deleted
+automatically.
 
 The target digest is computed from each layer's K/V label, dtype, shape, and
 contiguous CPU tensor bytes. It does not hash the outer `torch.save` container,
