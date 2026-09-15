@@ -136,3 +136,25 @@ python defense/eval/kivi_adapter_benchmark.py \
 
 These timings describe the offline adapter only. They are not an
 end-to-end KIVI model-throughput claim.
+
+### AES-GCM on FP vs packed quantized caches
+
+`defense/eval/aes_quant_benchmark.py` feeds the existing AES baseline
+(`KVCacheAESProtecter.encrypt_native`/`decrypt_native` for packed payloads)
+with FP16, INT4, INT3-size and INT2 caches from the same real prefill, and
+reports encrypt/decrypt/total time, GB/s, and overhead against FP16 prefill
+and decode:
+
+```bash
+python defense/eval/aes_quant_benchmark.py \
+  --model-path .models/Llama-3.2-1B --device cuda:0 --dtype float16 \
+  --seq-lens 512,1024,2048,4096 --batch-sizes 1 --trials 10
+```
+
+INT4/INT2 are real `kivi-native-v1` payloads (full-prompt-quantized, group
+32). KIVI has no 3-bit kernel, so `INT3-size` keeps the real INT4
+scale/min tensors and replaces the codes by random bytes of the dense 3-bit
+size; it is valid for AES timing only. The benchmark checks this size model
+against KIVI's real INT2 payload before timing. Results are written to
+`defense/result/aes_quant_benchmark/` as raw JSONL plus a Markdown summary
+with a linear fit of AES time against plaintext bytes.
