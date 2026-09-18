@@ -132,6 +132,60 @@ class TestAESProtector:
         assert "128bits" in repr_str or "256bits" in repr_str
 
 
+def _fake_native_cache():
+    """Packed-cache stand-in with the kivi-native-v1 field layout."""
+    layers = []
+    for layer_index in range(2):
+        layers.append(
+            {
+                "key_code": torch.randint(-(2**31), 2**31 - 1, (1, 2, 4, 1), dtype=torch.int32),
+                "key_scale": torch.rand(1, 2, 4, 1).half(),
+                "key_min": torch.rand(1, 2, 4, 1).half(),
+                "key_residual": torch.empty(1, 2, 0, 4, dtype=torch.float16),
+                "value_code": None,
+                "value_scale": None,
+                "value_min": None,
+                "value_residual": torch.randn(1, 2, 8, 4).half(),
+                "seq_len": 8,
+                "key_shape": (1, 2, 8, 4),
+                "layer_index": layer_index,
+            }
+        )
+    return {"format": "kivi-native-v1", "num_layers": 2, "layers": tuple(layers)}
+
+
+class TestNativePayload:
+    """Tests for AES over packed KIVI payloads."""
+
+    def test_native_roundtrip_is_bit_exact(self, aes_protector):
+        native = _fake_native_cache()
+        restored = aes_protector.decrypt_native(aes_protector.encrypt_native(native))
+
+        assert restored["format"] == "kivi-native-v1"
+        assert len(restored["layers"]) == 2
+        for original, layer in zip(native["layers"], restored["layers"]):
+            assert set(layer) == set(original)
+            for name, value in original.items():
+                if torch.is_tensor(value):
+                    assert layer[name].dtype == value.dtype
+                    assert torch.equal(layer[name], value)
+                else:
+                    assert layer[name] == value
+
+    def test_native_encrypts_only_tensor_fields(self, aes_protector):
+        encrypted = aes_protector.encrypt_native(_fake_native_cache())
+
+        layer = encrypted["layers"][0]
+        assert set(layer["encrypted"]) == {
+            "key_code", "key_scale", "key_min", "key_residual", "value_residual"
+        }
+        assert layer["plain"]["value_code"] is None
+        assert layer["plain"]["key_shape"] == (1, 2, 8, 4)
+        for nonce, ciphertext, _, _ in layer["encrypted"].values():
+            assert len(nonce) == 12
+            assert isinstance(ciphertext, bytes)
+
+
 class TestTensorConversion:
     """Tests for tensor to bytes conversion."""
     

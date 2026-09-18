@@ -176,23 +176,67 @@ class KVCacheAESProtecter:
         except Exception as e:
             raise TypeError(f"Unsupported KV cache object type: {type(past_key_values)}") from e
     
+    def _encrypt_tensor(self, aesgcm: AESGCM, tensor: torch.Tensor) -> tuple:
+        """Encrypt one tensor as (nonce, ciphertext, shape, dtype)."""
+        data, shape, dtype = self._tensor_to_bytes(tensor)
+        nonce = os.urandom(self.nonce_size)
+        return (nonce, aesgcm.encrypt(nonce, data, None), shape, dtype)
+
+    def _decrypt_tensor(self, aesgcm: AESGCM, encrypted: tuple) -> torch.Tensor:
+        """Decrypt one (nonce, ciphertext, shape, dtype) tuple into a tensor."""
+        nonce, ciphertext, shape, dtype = encrypted
+        data = aesgcm.decrypt(nonce, ciphertext, None)
+        return self._bytes_to_tensor(data, shape, dtype)
+
     def _encrypt_layer(self, encrypted_cache: list, key_states, value_states):
         """Encrypt a single layer."""
         aesgcm = AESGCM(self.key)
-
-        # Encrypt Key
-        key_bytes, key_shape, key_dtype = self._tensor_to_bytes(key_states)
-        nonce_k = os.urandom(self.nonce_size)
-        ct_bytes_k = aesgcm.encrypt(nonce_k, key_bytes, None)
-        encrypted_key = (nonce_k, ct_bytes_k, key_shape, key_dtype)
-
-        # Encrypt Value
-        value_bytes, value_shape, value_dtype = self._tensor_to_bytes(value_states)
-        nonce_v = os.urandom(self.nonce_size)
-        ct_bytes_v = aesgcm.encrypt(nonce_v, value_bytes, None)
-        encrypted_value = (nonce_v, ct_bytes_v, value_shape, value_dtype)
-
+        encrypted_key = self._encrypt_tensor(aesgcm, key_states)
+        encrypted_value = self._encrypt_tensor(aesgcm, value_states)
         encrypted_cache.append([encrypted_key, encrypted_value])
+
+    def encrypt_native(self, native_cache: dict) -> dict:
+        """Encrypt every tensor field of a packed ``kivi-native-v1`` cache.
+
+        Packed codes, scales, minimums and FP residuals are encrypted with the
+        same per-tensor AES-GCM path as :meth:`encrypt`. Non-tensor metadata
+        (lengths, shapes, config) stays in plaintext, as tensor shapes already
+        do for the FP cache.
+
+        Args:
+            native_cache: Output of ``src.kivi_adapter.quantize_cache``
+
+        Returns:
+            Copy of ``native_cache`` whose layers are
+            ``{"encrypted": {field: (nonce, ciphertext, shape, dtype)},
+            "plain": {field: value}}``
+        """
+        aesgcm = AESGCM(self.key)
+        encrypted_layers = []
+        for layer in native_cache["layers"]:
+            encrypted, plain = {}, {}
+            for name, value in layer.items():
+                if torch.is_tensor(value):
+                    encrypted[name] = self._encrypt_tensor(aesgcm, value)
+                else:
+                    plain[name] = value
+            encrypted_layers.append({"encrypted": encrypted, "plain": plain})
+        return {**native_cache, "layers": tuple(encrypted_layers)}
+
+    def decrypt_native(self, encrypted_cache: dict) -> dict:
+        """Decrypt the output of :meth:`encrypt_native` back to a native cache.
+
+        The result can be passed directly to
+        ``src.kivi_adapter.dequantize_cache``.
+        """
+        aesgcm = AESGCM(self.key)
+        layers = []
+        for layer in encrypted_cache["layers"]:
+            restored = dict(layer["plain"])
+            for name, encrypted in layer["encrypted"].items():
+                restored[name] = self._decrypt_tensor(aesgcm, encrypted)
+            layers.append(restored)
+        return {**encrypted_cache, "layers": tuple(layers)}
 
     def decrypt(self, encrypted_cache: list) -> DynamicCache:
         """Decrypt the entire KV-Cache.
@@ -207,17 +251,8 @@ class KVCacheAESProtecter:
         
         for encrypted_key, encrypted_value in encrypted_cache:
             aesgcm = AESGCM(self.key)
-
-            # Decrypt Key
-            nonce_k, ct_bytes_k, key_shape, key_dtype = encrypted_key
-            pt_bytes_k = aesgcm.decrypt(nonce_k, ct_bytes_k, None)
-            key_states = self._bytes_to_tensor(pt_bytes_k, key_shape, key_dtype)
-
-            # Decrypt Value
-            nonce_v, ct_bytes_v, value_shape, value_dtype = encrypted_value
-            pt_bytes_v = aesgcm.decrypt(nonce_v, ct_bytes_v, None)
-            value_states = self._bytes_to_tensor(pt_bytes_v, value_shape, value_dtype)
-
+            key_states = self._decrypt_tensor(aesgcm, encrypted_key)
+            value_states = self._decrypt_tensor(aesgcm, encrypted_value)
             decrypted_kv_list.append((key_states, value_states))
 
         # Build DynamicCache in a version-compatible way.
