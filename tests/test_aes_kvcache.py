@@ -139,7 +139,8 @@ def _fake_native_cache():
         layers.append(
             {
                 "key_code": torch.randint(-(2**31), 2**31 - 1, (1, 2, 4, 1), dtype=torch.int32),
-                "key_scale": torch.rand(1, 2, 4, 1).half(),
+                # Odd byte count before an int32 field exercises alignment.
+                "key_scale": torch.rand(1, 1, 3, 1).half(),
                 "key_min": torch.rand(1, 2, 4, 1).half(),
                 "key_residual": torch.empty(1, 2, 0, 4, dtype=torch.float16),
                 "value_code": None,
@@ -154,36 +155,73 @@ def _fake_native_cache():
     return {"format": "kivi-native-v1", "num_layers": 2, "layers": tuple(layers)}
 
 
-class TestNativePayload:
-    """Tests for AES over packed KIVI payloads."""
+class TestLayerwisePayload:
+    """Tests for one-AES-call-per-layer encryption of layered caches."""
 
-    def test_native_roundtrip_is_bit_exact(self, aes_protector):
-        native = _fake_native_cache()
-        restored = aes_protector.decrypt_native(aes_protector.encrypt_native(native))
-
-        assert restored["format"] == "kivi-native-v1"
-        assert len(restored["layers"]) == 2
-        for original, layer in zip(native["layers"], restored["layers"]):
+    def _assert_same(self, original_cache, restored_cache):
+        assert len(restored_cache["layers"]) == len(original_cache["layers"])
+        for original, layer in zip(original_cache["layers"], restored_cache["layers"]):
             assert set(layer) == set(original)
             for name, value in original.items():
                 if torch.is_tensor(value):
                     assert layer[name].dtype == value.dtype
+                    assert layer[name].shape == value.shape
                     assert torch.equal(layer[name], value)
                 else:
                     assert layer[name] == value
 
-    def test_native_encrypts_only_tensor_fields(self, aes_protector):
-        encrypted = aes_protector.encrypt_native(_fake_native_cache())
+    def test_native_roundtrip_is_bit_exact(self, aes_protector):
+        native = _fake_native_cache()
+        restored = aes_protector.decrypt_layers(aes_protector.encrypt_layers(native))
 
-        layer = encrypted["layers"][0]
-        assert set(layer["encrypted"]) == {
-            "key_code", "key_scale", "key_min", "key_residual", "value_residual"
+        assert restored["format"] == "kivi-native-v1"
+        self._assert_same(native, restored)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_fp_roundtrip_is_bit_exact(self, aes_protector, dtype):
+        cache = {
+            "layers": tuple(
+                {"key": torch.randn(1, 2, 5, 8).to(dtype), "value": torch.randn(1, 2, 5, 8).to(dtype)}
+                for _ in range(3)
+            )
         }
-        assert layer["plain"]["value_code"] is None
-        assert layer["plain"]["key_shape"] == (1, 2, 8, 4)
-        for nonce, ciphertext, _, _ in layer["encrypted"].values():
-            assert len(nonce) == 12
-            assert isinstance(ciphertext, bytes)
+        self._assert_same(cache, aes_protector.decrypt_layers(aes_protector.encrypt_layers(cache)))
+
+    def test_one_aes_call_per_layer_over_all_tensor_bytes(self, aes_protector):
+        native = _fake_native_cache()
+        encrypted = aes_protector.encrypt_layers(native)
+
+        for original, layer in zip(native["layers"], encrypted["layers"]):
+            tensor_bytes = sum(
+                v.numel() * v.element_size() for v in original.values() if torch.is_tensor(v)
+            )
+            assert len(layer["nonce"]) == 12
+            assert len(layer["ciphertext"]) == tensor_bytes + 16
+            assert {name for name, *_ in layer["fields"]} == {
+                "key_code", "key_scale", "key_min", "key_residual", "value_residual"
+            }
+            assert layer["plain"]["value_code"] is None
+            assert layer["plain"]["key_shape"] == (1, 2, 8, 4)
+            assert not any(torch.is_tensor(v) for v in layer["plain"].values())
+
+    def test_profile_reports_phases(self, aes_protector):
+        profile = {}
+        encrypted = aes_protector.encrypt_layers(_fake_native_cache(), profile)
+        aes_protector.decrypt_layers(encrypted, profile)
+
+        assert set(profile) == {"gather", "aes", "scatter"}
+        assert all(seconds >= 0 for seconds in profile.values())
+
+    def test_tampered_ciphertext_is_rejected(self, aes_protector):
+        from cryptography.exceptions import InvalidTag
+
+        encrypted = aes_protector.encrypt_layers(_fake_native_cache())
+        layer = dict(encrypted["layers"][0])
+        layer["ciphertext"] = bytes([layer["ciphertext"][0] ^ 1]) + layer["ciphertext"][1:]
+        tampered = {**encrypted, "layers": (layer, *encrypted["layers"][1:])}
+
+        with pytest.raises(InvalidTag):
+            aes_protector.decrypt_layers(tampered)
 
 
 class TestTensorConversion:

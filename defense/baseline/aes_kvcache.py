@@ -2,7 +2,9 @@
 """AES-GCM encryption for KV-cache protection."""
 
 import os
-from typing import Tuple, Union
+import time
+from typing import Optional, Tuple, Union
+import warnings
 import torch
 import numpy as np
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -195,47 +197,104 @@ class KVCacheAESProtecter:
         encrypted_value = self._encrypt_tensor(aesgcm, value_states)
         encrypted_cache.append([encrypted_key, encrypted_value])
 
-    def encrypt_native(self, native_cache: dict) -> dict:
-        """Encrypt every tensor field of a packed ``kivi-native-v1`` cache.
+    def encrypt_layers(self, cache: dict, profile: Optional[dict] = None) -> dict:
+        """Encrypt a layered cache with exactly one AES-GCM call per layer.
 
-        Packed codes, scales, minimums and FP residuals are encrypted with the
-        same per-tensor AES-GCM path as :meth:`encrypt`. Non-tensor metadata
-        (lengths, shapes, config) stays in plaintext, as tensor shapes already
-        do for the FP cache.
+        ``cache["layers"]`` is a sequence of dicts: ``{"key", "value"}`` for an
+        FP cache, or the packed codes/scales/minimums/residuals of a
+        ``kivi-native-v1`` cache. All tensor fields of a layer are viewed as
+        bytes on their device, concatenated, copied to the host once and
+        encrypted as one message without further host copies. FP and packed
+        caches thus pay the same number of AES calls, and the work scales with
+        the payload bytes only. Non-tensor metadata stays in plaintext, as
+        tensor shapes already do in :meth:`encrypt`.
 
         Args:
-            native_cache: Output of ``src.kivi_adapter.quantize_cache``
+            cache: Layered cache, e.g. ``src.kivi_adapter.quantize_cache`` output
+            profile: Optional dict; seconds spent in ``"gather"`` (byte view,
+                concatenation, device-to-host copy) and ``"aes"`` are added
 
         Returns:
-            Copy of ``native_cache`` whose layers are
-            ``{"encrypted": {field: (nonce, ciphertext, shape, dtype)},
-            "plain": {field: value}}``
+            Copy of ``cache`` whose layers are ``{"nonce", "ciphertext",
+            "fields": [(name, shape, dtype, nbytes)], "plain": {...}}``
         """
         aesgcm = AESGCM(self.key)
+        gather_seconds = aes_seconds = 0.0
         encrypted_layers = []
-        for layer in native_cache["layers"]:
-            encrypted, plain = {}, {}
-            for name, value in layer.items():
-                if torch.is_tensor(value):
-                    encrypted[name] = self._encrypt_tensor(aesgcm, value)
-                else:
-                    plain[name] = value
-            encrypted_layers.append({"encrypted": encrypted, "plain": plain})
-        return {**native_cache, "layers": tuple(encrypted_layers)}
+        for layer in cache["layers"]:
+            plain = {name: value for name, value in layer.items() if not torch.is_tensor(value)}
+            # Widest dtypes first keeps every field aligned for the reverse view.
+            tensors = sorted(
+                ((name, value) for name, value in layer.items() if torch.is_tensor(value)),
+                key=lambda item: -item[1].element_size(),
+            )
+            start = time.perf_counter()
+            chunks = [value.contiguous().view(-1).view(torch.uint8) for _, value in tensors]
+            host = torch.cat(chunks).cpu().numpy() if chunks else np.empty(0, dtype=np.uint8)
+            middle = time.perf_counter()
+            nonce = os.urandom(self.nonce_size)
+            ciphertext = aesgcm.encrypt(nonce, host, None)
+            end = time.perf_counter()
+            gather_seconds += middle - start
+            aes_seconds += end - middle
+            encrypted_layers.append(
+                {
+                    "nonce": nonce,
+                    "ciphertext": ciphertext,
+                    "fields": [
+                        (name, tuple(value.shape), value.dtype, chunk.numel())
+                        for (name, value), chunk in zip(tensors, chunks)
+                    ],
+                    "plain": plain,
+                }
+            )
+        if profile is not None:
+            profile["gather"] = profile.get("gather", 0.0) + gather_seconds
+            profile["aes"] = profile.get("aes", 0.0) + aes_seconds
+        return {**cache, "layers": tuple(encrypted_layers)}
 
-    def decrypt_native(self, encrypted_cache: dict) -> dict:
-        """Decrypt the output of :meth:`encrypt_native` back to a native cache.
+    def decrypt_layers(self, encrypted_cache: dict, profile: Optional[dict] = None) -> dict:
+        """Decrypt the output of :meth:`encrypt_layers` onto ``self.device``.
 
-        The result can be passed directly to
-        ``src.kivi_adapter.dequantize_cache``.
+        Each layer is decrypted with one AES-GCM call, copied to the device
+        once and split back into its fields. A packed KIVI result can be
+        passed directly to ``src.kivi_adapter.dequantize_cache``.
+
+        Args:
+            encrypted_cache: Output of :meth:`encrypt_layers`
+            profile: Optional dict; seconds spent in ``"aes"`` and ``"scatter"``
+                (host-to-device copy and split) are added
         """
         aesgcm = AESGCM(self.key)
+        aes_seconds = scatter_seconds = 0.0
         layers = []
         for layer in encrypted_cache["layers"]:
+            start = time.perf_counter()
+            plaintext = aesgcm.decrypt(layer["nonce"], layer["ciphertext"], None)
+            middle = time.perf_counter()
+            if plaintext:
+                with warnings.catch_warnings():
+                    # Read-only buffer is fine: it is copied to the device below.
+                    warnings.simplefilter("ignore", UserWarning)
+                    host = torch.frombuffer(plaintext, dtype=torch.uint8)
+            else:
+                host = torch.empty(0, dtype=torch.uint8)
+            device_bytes = host.to(self.device, copy=True)
             restored = dict(layer["plain"])
-            for name, encrypted in layer["encrypted"].items():
-                restored[name] = self._decrypt_tensor(aesgcm, encrypted)
+            offset = 0
+            for name, shape, dtype, nbytes in layer["fields"]:
+                restored[name] = device_bytes[offset : offset + nbytes].view(dtype).view(shape)
+                offset += nbytes
+            if profile is not None and device_bytes.is_cuda:
+                # Pageable H2D copies may still be in flight; attribute them here.
+                torch.cuda.synchronize(device_bytes.device)
+            end = time.perf_counter()
+            aes_seconds += middle - start
+            scatter_seconds += end - middle
             layers.append(restored)
+        if profile is not None:
+            profile["aes"] = profile.get("aes", 0.0) + aes_seconds
+            profile["scatter"] = profile.get("scatter", 0.0) + scatter_seconds
         return {**encrypted_cache, "layers": tuple(layers)}
 
     def decrypt(self, encrypted_cache: list) -> DynamicCache:

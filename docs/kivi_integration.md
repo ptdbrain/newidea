@@ -158,21 +158,36 @@ end-to-end KIVI model-throughput claim.
 ### AES-GCM on FP vs packed quantized caches
 
 `defense/eval/aes_quant_benchmark.py` feeds the existing AES baseline
-(`KVCacheAESProtecter.encrypt_native`/`decrypt_native` for packed payloads)
-with FP16, INT4, INT3-size and INT2 caches from the same real prefill, and
-reports encrypt/decrypt/total time, GB/s, and overhead against FP16 prefill
-and decode:
+(`KVCacheAESProtecter.encrypt_layers`/`decrypt_layers`) with FP16, INT4,
+INT3 and INT2 caches from the same real prefill, and reports
+encrypt/decrypt/total time, AES-only time, GB/s, and overhead against FP16
+prefill and decode:
 
 ```bash
-python defense/eval/aes_quant_benchmark.py \
-  --model-path .models/Llama-3.2-1B --device cuda:0 --dtype float16 \
-  --seq-lens 512,1024,2048,4096 --batch-sizes 1 --trials 10
+python defense/eval/aes_quant_benchmark.py   --model-path .models/Llama-3.2-1B --device cuda:0 --dtype float16   --seq-lens 128,512,1024,2048,4096 --batch-sizes 1 --trials 20
 ```
 
-INT4/INT2 are real `kivi-native-v1` payloads (full-prompt-quantized, group
-32). KIVI has no 3-bit kernel, so `INT3-size` keeps the real INT4
-scale/min tensors and replaces the codes by random bytes of the dense 3-bit
-size; it is valid for AES timing only. The benchmark checks this size model
-against KIVI's real INT2 payload before timing. Results are written to
-`defense/result/aes_quant_benchmark/` as raw JSONL plus a Markdown summary
-with a linear fit of AES time against plaintext bytes.
+Every condition goes through the same code path with exactly one AES-GCM
+call per layer: all tensors of a layer are viewed as bytes, gathered, copied
+to the host once and encrypted as one message, so FP and packed caches differ
+only in byte count. Before timing, the benchmark verifies the packed size,
+a bit-exact roundtrip, the ciphertext size, equal AES call counts, and
+`dequantize(decrypt(encrypt(q))) == dequantize(q)` for quantized payloads.
+Encrypt and decrypt of all conditions are then timed interleaved in a
+shuffled order per round with GC paused; medians are reported together with
+the gather / AES / scatter phase split and a raw AES-GCM calibration of the
+host. Results are written to `defense/result/aes_quant_benchmark/` as raw
+JSONL plus JSON/Markdown summaries with a linear fit of time against
+plaintext bytes.
+
+### 3-bit caches
+
+The pinned KIVI checkout only packs 2, 4 and 8 bits. `KIVIConfig` also
+accepts `k_bits`/`v_bits` = 3: `src/int3_quant.py` applies KIVI's own group
+formula (per-group min/max, `scale = (max - min) / 7`, clamp and round, the
+same `[B, H, D, groups]` scale/min layout) and adds a dense 3-bit packing,
+8 values in 3 uint8 bytes. INT2/INT4/INT8 still use the KIVI kernels. Payloads
+and `metadata.json` carry `int3_extension: true` so 3-bit results are never
+mistaken for upstream KIVI output. The same condition can be materialized for
+the attack harness, e.g. `--k-bits 3 --v-bits 3` in
+`defense/baseline/kivi_kvcache.py`.

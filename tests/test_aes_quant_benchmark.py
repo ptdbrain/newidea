@@ -11,9 +11,11 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 from defense.baseline.aes_kvcache import KVCacheAESProtecter  # noqa: E402
 from defense.eval.aes_quant_benchmark import (  # noqa: E402
     benchmark_aes,
+    expected_payload_nbytes,
+    fp_payload,
     linear_fit,
+    measure_interleaved,
     payload_nbytes,
-    size_equivalent_payload,
     summarize,
 )
 
@@ -21,16 +23,19 @@ from defense.eval.aes_quant_benchmark import (  # noqa: E402
 def _native(seq_len=64, head_dim=64, heads=2, bits=4):
     """INT-``bits`` payload with KIVI's full-prompt-quantized shapes."""
     groups = seq_len // 32
-    values_per_int = 32 // bits
+    if bits == 3:  # dense uint8 packing from src/int3_quant.py
+        code_dtype, key_code_len, value_code_len = torch.uint8, seq_len * 3 // 8, head_dim * 3 // 8
+    else:
+        code_dtype, key_code_len, value_code_len = torch.int32, seq_len * bits // 32, head_dim * bits // 32
     return {
         "format": "kivi-native-v1",
         "layers": (
             {
-                "key_code": torch.zeros(1, heads, head_dim, seq_len // values_per_int, dtype=torch.int32),
+                "key_code": torch.zeros(1, heads, head_dim, key_code_len, dtype=code_dtype),
                 "key_scale": torch.ones(1, heads, head_dim, groups, dtype=torch.float16),
                 "key_min": torch.zeros(1, heads, head_dim, groups, dtype=torch.float16),
                 "key_residual": torch.empty(1, heads, 0, head_dim, dtype=torch.float16),
-                "value_code": torch.zeros(1, heads, seq_len, head_dim // values_per_int, dtype=torch.int32),
+                "value_code": torch.zeros(1, heads, seq_len, value_code_len, dtype=code_dtype),
                 "value_scale": torch.ones(1, heads, seq_len, head_dim // 32, dtype=torch.float16),
                 "value_min": torch.zeros(1, heads, seq_len, head_dim // 32, dtype=torch.float16),
                 "value_residual": torch.empty(1, heads, 0, head_dim, dtype=torch.float16),
@@ -41,7 +46,7 @@ def _native(seq_len=64, head_dim=64, heads=2, bits=4):
 
 
 def test_payload_nbytes_counts_fp_and_native_tensors():
-    fp = ((torch.zeros(1, 2, 64, 64, dtype=torch.float16),) * 2,)
+    fp = fp_payload(((torch.zeros(1, 2, 64, 64, dtype=torch.float16),) * 2,))
     assert payload_nbytes(fp) == 2 * 2 * 64 * 64 * 2
 
     native = _native()
@@ -50,30 +55,73 @@ def test_payload_nbytes_counts_fp_and_native_tensors():
     assert payload_nbytes(native) == values // 2 * 2 + metadata
 
 
-def test_size_equivalent_payload_matches_real_bit_width_sizes():
-    int4 = _native(bits=4)
+@pytest.mark.parametrize("bits", [4, 3, 2])
+def test_expected_payload_nbytes_matches_packed_layout(bits):
+    fp = ((torch.zeros(1, 2, 64, 64, dtype=torch.float16),) * 2,)
 
-    assert payload_nbytes(size_equivalent_payload(int4, 4, 2)) == payload_nbytes(_native(bits=2))
-    int3 = size_equivalent_payload(int4, 4, 3)
-    layer = int3["layers"][0]
-    assert layer["key_code"].numel() == 2 * 64 * 64 * 3 // 8
-    assert layer["key_code"].dtype == torch.uint8
-    assert layer["key_scale"] is int4["layers"][0]["key_scale"]
-    assert int3["size_equivalent_bits"] == 3
-
-
-@pytest.mark.parametrize("payload", [_native(), ((torch.randn(1, 2, 64, 64).half(),) * 2,)])
-def test_benchmark_aes_reports_split_timings(payload):
-    protector = KVCacheAESProtecter(b"0123456789abcdef", device="cpu")
-
-    result = benchmark_aes(protector, payload, device=torch.device("cpu"), warmup=0, trials=2)
-
-    assert result["payload_bytes"] == payload_nbytes(payload)
-    assert result["ciphertext_bytes"] == result["payload_bytes"] + 28 * result["num_aes_calls"]
-    assert result["total_ms_mean"] == pytest.approx(
-        result["encrypt_ms"]["mean"] + result["decrypt_ms"]["mean"]
+    assert expected_payload_nbytes(fp, bits, 32) == payload_nbytes(_native(bits=bits))
+    assert expected_payload_nbytes(fp, bits, 32) / payload_nbytes(fp_payload(fp)) == pytest.approx(
+        (bits / 8 + 4 / 32) / 2
     )
-    assert result["roundtrip_GBps"] > 0
+
+
+def test_expected_payload_nbytes_counts_key_padding():
+    fp = ((torch.zeros(1, 1, 40, 64, dtype=torch.float16),) * 2,)  # keys padded to 64 tokens
+
+    per_value = 4 / 8 + 4 / 32
+    assert expected_payload_nbytes(fp, 4, 32) == (64 + 40) * 64 * per_value
+
+
+def test_benchmark_aes_equal_calls_and_split_timings():
+    protector = KVCacheAESProtecter(b"0123456789abcdef", device="cpu")
+    int4 = _native(bits=4)
+    payloads = {
+        "FP16": fp_payload(((torch.randn(1, 2, 64, 64).half(), torch.randn(1, 2, 64, 64).half()),)),
+        "INT4": int4,
+        "INT3": _native(bits=3),
+    }
+
+    results = benchmark_aes(protector, payloads, device=torch.device("cpu"), warmup=0, trials=3)
+
+    assert {result["num_aes_calls"] for result in results.values()} == {1}
+    for name, result in results.items():
+        assert result["payload_bytes"] == payload_nbytes(payloads[name])
+        assert result["ciphertext_bytes"] == result["payload_bytes"] + 16
+        assert result["total_ms"] == pytest.approx(
+            result["encrypt_ms"]["median"] + result["decrypt_ms"]["median"]
+        )
+        assert result["aes_only_ms"] == pytest.approx(
+            result["encrypt_aes_ms"]["median"] + result["decrypt_aes_ms"]["median"]
+        )
+        assert result["encrypt_ms"]["n"] == 3
+        assert result["roundtrip_GBps"] > 0
+
+
+def test_benchmark_aes_rejects_unequal_call_counts():
+    protector = KVCacheAESProtecter(b"0123456789abcdef", device="cpu")
+    one_layer = _native()
+    two_layers = {**one_layer, "layers": one_layer["layers"] * 2}
+
+    with pytest.raises(RuntimeError, match="call counts"):
+        benchmark_aes(protector, {"a": one_layer, "b": two_layers}, device=torch.device("cpu"), warmup=0, trials=1)
+
+
+def test_measure_interleaved_runs_every_task_and_collects_phases():
+    calls = []
+
+    def task(name):
+        def run(profile):
+            calls.append(name)
+            profile["phase"] = 0.001
+        return run
+
+    timings = measure_interleaved(
+        {"a": task("a"), "b": task("b")}, device=torch.device("cpu"), warmup=1, trials=4, seed=0
+    )
+
+    assert calls.count("a") == calls.count("b") == 5
+    assert timings["a"]["total"]["n"] == 4
+    assert timings["b"]["phase"]["median"] == pytest.approx(1.0)
 
 
 def test_linear_fit_recovers_line():
@@ -93,9 +141,10 @@ def test_summarize_reports_ratios_against_fp16():
             "seq_len": 512,
             "condition": condition,
             "payload_bytes": payload_bytes,
-            "encrypt_ms": {"mean": total_ms / 2},
-            "decrypt_ms": {"mean": total_ms / 2},
-            "total_ms_mean": total_ms,
+            "encrypt_ms": {"median": total_ms / 2},
+            "decrypt_ms": {"median": total_ms / 2},
+            "total_ms": total_ms,
+            "aes_only_ms": total_ms / 2,
         }
 
     summary = summarize([record("FP16", 1000, 10.0), record("INT4", 250, 3.0)])

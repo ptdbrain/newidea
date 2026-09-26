@@ -14,8 +14,10 @@ from typing import Any, Iterable, Mapping
 import torch
 
 try:
+    from . import int3_quant
     from .provenance import KIVI_COMMIT, KVCLOAK_COMMIT
 except ImportError:  # Support legacy ``sys.path += ['src']; import kivi_adapter``.
+    import int3_quant
     from provenance import KIVI_COMMIT, KVCLOAK_COMMIT
 
 
@@ -51,10 +53,11 @@ class KIVIConfig:
     mode: str = "standard"
 
     def __post_init__(self) -> None:
-        if self.k_bits not in (2, 4, 8):
-            raise ValueError("k_bits must be one of 2, 4, or 8")
-        if self.v_bits not in (2, 4, 8):
-            raise ValueError("v_bits must be one of 2, 4, or 8")
+        # 3 bits uses KIVI's formula with the dense packing in int3_quant.
+        if self.k_bits not in (2, 3, 4, 8):
+            raise ValueError("k_bits must be one of 2, 3, 4, or 8")
+        if self.v_bits not in (2, 3, 4, 8):
+            raise ValueError("v_bits must be one of 2, 3, 4, or 8")
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.residual_length <= 0:
@@ -90,6 +93,27 @@ def _legacy_layers(past_key_values: Any) -> tuple[tuple[torch.Tensor, torch.Tens
     return tuple(normalized)
 
 
+def _values_per_pack(bits: int) -> int:
+    """Quantized values that share one packed unit along the packed axis."""
+    return int3_quant.VALUES_PER_PACK if bits == 3 else 32 // bits
+
+
+def _quantize_last_dim(
+    data: torch.Tensor, group_size: int, bits: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if bits == 3:
+        return int3_quant.quantize_and_pack_along_last_dim(data, group_size)
+    return triton_quantize_and_pack_along_last_dim(data, group_size, bits)
+
+
+def _dequantize_last_dim(
+    code: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor, group_size: int, bits: int
+) -> torch.Tensor:
+    if bits == 3:
+        return int3_quant.unpack_and_dequant(code, scale, mn, group_size)
+    return unpack_and_dequant_vcache(code, scale, mn, group_size, bits)
+
+
 def _key_partition_lengths(
     sequence_length: int, config: KIVIConfig
 ) -> tuple[int, int]:
@@ -105,7 +129,7 @@ def _key_partition_lengths(
         # The public KIVI key kernel groups along the sequence dimension and
         # packs several quantized values into one int32.  Padding is outside
         # the prompt and is removed again by dequantize_cache().
-        required_multiple = math.lcm(config.group_size, 32 // config.k_bits)
+        required_multiple = math.lcm(config.group_size, _values_per_pack(config.k_bits))
         padded_length = math.ceil(sequence_length / required_multiple) * required_multiple
         return padded_length, 0
 
@@ -117,7 +141,8 @@ def _key_partition_lengths(
         if sequence_length % config.residual_length == 0
         else sequence_length - (sequence_length % config.residual_length)
     )
-    quantized_length = candidate - candidate % config.group_size
+    unit = math.lcm(config.group_size, _values_per_pack(config.k_bits))
+    quantized_length = candidate - candidate % unit
     return quantized_length, sequence_length - quantized_length
 
 
@@ -136,13 +161,13 @@ def _value_partition_lengths(
 def _quantize_key(
     key_prefix: torch.Tensor, config: KIVIConfig
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    features_per_int = 32 // config.k_bits
+    features_per_int = _values_per_pack(config.k_bits)
     if key_prefix.shape[2] % features_per_int != 0:
         raise ValueError(
             "KIVI key quantization requires quantized sequence length divisible "
             f"by {features_per_int} ({key_prefix.shape[2]} % {features_per_int} != 0)"
         )
-    return triton_quantize_and_pack_along_last_dim(
+    return _quantize_last_dim(
         key_prefix.transpose(2, 3).contiguous(),
         config.group_size,
         config.k_bits,
@@ -157,13 +182,13 @@ def _quantize_value(
             "KIVI value quantization requires head dimension divisible by "
             f"group_size ({value_prefix.shape[-1]} % {config.group_size} != 0)"
         )
-    features_per_int = 32 // config.v_bits
+    features_per_int = _values_per_pack(config.v_bits)
     if value_prefix.shape[-1] % features_per_int != 0:
         raise ValueError(
             "KIVI value quantization requires head dimension divisible by "
             f"{features_per_int} ({value_prefix.shape[-1]} % {features_per_int} != 0)"
         )
-    return triton_quantize_and_pack_along_last_dim(
+    return _quantize_last_dim(
         value_prefix.contiguous(),
         config.group_size,
         config.v_bits,
@@ -257,6 +282,8 @@ def quantize_cache(
         "provenance": {
             "kivi_commit": KIVI_COMMIT,
             "kvcloak_commit": KVCLOAK_COMMIT,
+            # KIVI has no 3-bit packing; those codes come from src/int3_quant.py.
+            "int3_extension": 3 in (config.k_bits, config.v_bits),
         },
         "num_layers": len(native_layers),
         "layers": tuple(native_layers),
@@ -269,7 +296,7 @@ def _dequantize_key(
     code = layer["key_code"]
     if code is None:
         return None
-    dequantized_transposed = unpack_and_dequant_vcache(
+    dequantized_transposed = _dequantize_last_dim(
         code,
         layer["key_scale"].unsqueeze(-1),
         layer["key_min"].unsqueeze(-1),
@@ -285,7 +312,7 @@ def _dequantize_value(
     code = layer["value_code"]
     if code is None:
         return None
-    return unpack_and_dequant_vcache(
+    return _dequantize_last_dim(
         code,
         layer["value_scale"].unsqueeze(-1),
         layer["value_min"].unsqueeze(-1),

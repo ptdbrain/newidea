@@ -70,6 +70,8 @@ def _metadata(
         "group_size": config.group_size,
         "residual_length": config.residual_length,
         "mode": config.mode,
+        # KIVI has no 3-bit packing; those codes come from src/int3_quant.py.
+        "int3_extension": 3 in (config.k_bits, config.v_bits),
         "fp_residual_prompt_tokens": int(
             (native_cache or {}).get("fp_residual_prompt_tokens", 0)
         ),

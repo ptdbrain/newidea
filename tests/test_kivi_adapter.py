@@ -215,3 +215,24 @@ def test_four_bit_roundtrip_has_no_more_mse_than_two_bit():
         for reconstructed, original in zip(four_bit, source)
     )
     assert four_mse <= two_mse
+
+
+@pytest.mark.parametrize("mode", ["standard", "full_prompt_quantized"])
+def test_three_bit_uses_int3_extension_without_kivi_kernels(monkeypatch, mode):
+    calls = _install_fake_kivi(monkeypatch)
+    config = KIVIConfig(k_bits=3, v_bits=3, group_size=32, residual_length=32, mode=mode)
+    source = _cache(100)
+
+    quantized = quantize_cache(source, config)
+    restored = dequantize_cache(quantized, config)
+
+    assert calls == {"quantize": [], "dequantize": []}
+    assert quantized["provenance"]["int3_extension"] is True
+    layer = quantized["layers"][0]
+    assert layer["key_code"].dtype == torch.uint8
+    assert layer["value_code"].shape[-1] == 64 * 3 // 8
+    for (key, value), (source_key, source_value) in zip(restored, source):
+        assert key.shape == source_key.shape
+        assert value.shape == source_value.shape
+        assert torch.isfinite(key).all() and torch.isfinite(value).all()
+
